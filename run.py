@@ -25,12 +25,11 @@ def _add_silu_kernel(
     y_ptr,
     out_ptr,
     n_elements,
-    *,
-    BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -82,7 +81,7 @@ def add_silu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         y_,
         out_,
         n_elements,
-        BLOCK=block,
+        BLOCK_SIZE=block,
         OUT_DTYPE=dtype_map[x.dtype],
         num_warps=4,
     )
