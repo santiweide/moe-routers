@@ -125,18 +125,48 @@ class MoELayer(torch.nn.Module):
             return out.view(bsz, seq_len, d_model)
 
         # Sparse top-k MoE for regular execution (router implementation is pluggable).
+        #
+        # Optimization: token bucketing + per-expert batched GEMM.
+        # We expand routes (token, expert, weight) -> sort by expert -> run one
+        # expert MLP per contiguous bucket -> index_add back to token outputs.
         topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
 
+        s = flat.size(0)
+        k = self.top_k
+
+        # Routes: R = S*K
+        token_ids = torch.arange(s, device=flat.device, dtype=torch.int64).unsqueeze(1).expand(s, k).reshape(-1)
+        expert_ids = topk_idx.reshape(-1).to(dtype=torch.int64)  # [R]
+        weights = topk_w.reshape(-1).unsqueeze(-1)  # [R, 1]
+
+        # Gather inputs for each route.
+        x_route = flat.index_select(0, token_ids)  # [R, d]
+
+        # Sort routes by expert id for contiguous buckets.
+        sort_idx = torch.argsort(expert_ids)
+        expert_ids = expert_ids.index_select(0, sort_idx)
+        token_ids = token_ids.index_select(0, sort_idx)
+        weights = weights.index_select(0, sort_idx)
+        x_route = x_route.index_select(0, sort_idx)
+
+        # Compute bucket sizes for slicing.
+        counts = torch.bincount(expert_ids, minlength=self.n_experts)  # [E]
         out = torch.zeros_like(flat)
-        # Dispatch per expert per top-k slot (simple/reference implementation).
-        for slot in range(self.top_k):
-            idx_s = topk_idx[:, slot]  # [S]
-            w_s = topk_w[:, slot].unsqueeze(-1)  # [S, 1]
-            for e, expert in enumerate(self.experts):
-                mask = idx_s == e
-                if mask.any():
-                    y = expert(flat[mask])
-                    out[mask] = out[mask] + y * w_s[mask]
+
+        start = 0
+        for e, expert in enumerate(self.experts):
+            cnt = int(counts[e].item())
+            if cnt == 0:
+                continue
+            end = start + cnt
+            x_e = x_route[start:end]
+            w_e = weights[start:end]
+            tok_e = token_ids[start:end]
+
+            y_e = expert(x_e) * w_e  # [cnt, d]
+            out.index_add_(0, tok_e, y_e)
+
+            start = end
 
         return out.view(bsz, seq_len, d_model)
 
