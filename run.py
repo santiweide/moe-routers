@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Standalone minimal runnable demo: layernum=1 model + a custom Triton op (with Torch fallback).
 
@@ -55,6 +56,10 @@ def add_silu(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"dtype mismatch: x={x.dtype} y={y.dtype}")
     if x.device != y.device:
         raise ValueError(f"device mismatch: x={x.device} y={y.device}")
+
+    # ONNX export cannot capture Triton kernels; force Torch path during export.
+    if torch.onnx.is_in_onnx_export():
+        return _torch_add_silu(x, y)
 
     # Fallback path: CPU or Triton unavailable.
     if (not x.is_cuda) or (not HAS_TRITON):
