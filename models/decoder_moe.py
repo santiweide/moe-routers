@@ -265,6 +265,68 @@ class DecoderMoEModel(torch.nn.Module):
         x = self.final_norm(x)
         return self.lm_head(x)  # [B, T, vocab]
 
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        greedy: bool = False,
+    ) -> torch.Tensor:
+        """
+        Autoregressive decoding.
+
+        - greedy=True: argmax
+        - else: sampling with optional temperature/top-k/top-p.
+        """
+        if max_new_tokens <= 0:
+            return input_ids
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k must be > 0")
+        if top_p is not None and not (0.0 < top_p <= 1.0):
+            raise ValueError("top_p must be in (0, 1]")
+
+        self.eval()
+        out = input_ids
+        for _ in range(max_new_tokens):
+            logits = self(out)  # [B, T, V]
+            next_logits = logits[:, -1, :]  # [B, V]
+
+            if greedy:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+            else:
+                scores = next_logits / temperature
+
+                if top_k is not None:
+                    k = min(top_k, scores.size(-1))
+                    vals, idx = torch.topk(scores, k, dim=-1)
+                    filtered = torch.full_like(scores, float("-inf"))
+                    filtered.scatter_(dim=-1, index=idx, src=vals)
+                    scores = filtered
+
+                if top_p is not None:
+                    sorted_scores, sorted_idx = torch.sort(scores, descending=True, dim=-1)
+                    sorted_probs = torch.softmax(sorted_scores, dim=-1)
+                    cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                    remove = cumprobs > top_p
+                    # Keep at least one token.
+                    remove[..., 1:] = remove[..., :-1].clone()
+                    remove[..., 0] = False
+                    sorted_scores = sorted_scores.masked_fill(remove, float("-inf"))
+                    scores = torch.full_like(scores, float("-inf"))
+                    scores.scatter_(dim=-1, index=sorted_idx, src=sorted_scores)
+
+                probs = torch.softmax(scores, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+
+            out = torch.cat([out, next_token], dim=1)
+        return out
+
 
 __all__ = [
     "DecoderMoEConfig",
