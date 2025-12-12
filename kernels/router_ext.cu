@@ -2,6 +2,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <vector>
@@ -152,8 +154,8 @@ std::vector<torch::Tensor> topk_router_forward_cuda(torch::Tensor logits, int64_
   auto stream = at::cuda::getDefaultCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::Half,
-      at::BFloat16,
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
       logits.scalar_type(),
       "topk_router_forward_cuda",
       [&] {
