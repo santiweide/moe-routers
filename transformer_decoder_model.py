@@ -79,7 +79,10 @@ class RotaryEmbedding(torch.nn.Module):
     def _build_cache(self, seq_len: int, device: torch.device) -> None:
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device=device))
-        emb = torch.cat((freqs, freqs), dim=-1)  # [T, head_dim]
+        # Interleave each frequency across a pair of dims:
+        # [f0, f1, ...] -> [f0, f0, f1, f1, ...]
+        # so each (even, odd) dimension pair shares the same frequency.
+        emb = freqs.repeat_interleave(2, dim=-1)  # [T, head_dim]
         self._cos_cached = emb.cos()
         self._sin_cached = emb.sin()
         self._cached_seq_len = seq_len
@@ -130,7 +133,10 @@ class MaskedSelfAttention(torch.nn.Module):
             q, k = apply_rope(q, k, cos.to(dtype=q.dtype), sin.to(dtype=q.dtype))
 
         # PyTorch 2.x fast path. `is_causal=True` applies causal mask internally.
-        if hasattr(F, "scaled_dot_product_attention"):
+        #
+        # NOTE: ONNX export support for scaled_dot_product_attention varies across
+        # PyTorch versions. Force the manual path during export for stability.
+        if (not torch.onnx.is_in_onnx_export()) and hasattr(F, "scaled_dot_product_attention"):
             attn = F.scaled_dot_product_attention(
                 q,
                 k,

@@ -24,6 +24,12 @@ If you have CUDA + Triton:
 python run.py --device cuda --dtype fp16 --batch 8 --hidden 4096
 ```
 
+Run the Transformer decoder demo:
+
+```bash
+python run.py --model transformer_decoder --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048
+```
+
 ## Export (Netron-friendly ONNX)
 
 Export as an ONNX pair:
@@ -32,6 +38,12 @@ Export as an ONNX pair:
 
 ```bash
 python run.py --device cpu --dtype fp32 --batch 2 --hidden 128 --export_onnx_dir /tmp/netron_model
+```
+
+Export the Transformer decoder model:
+
+```bash
+python run.py --model transformer_decoder --device cpu --dtype fp32 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --export_onnx_dir /tmp/netron_transformer
 ```
 
 Open `__model__` in Netron.
