@@ -22,10 +22,10 @@ from pathlib import Path
 
 import torch
 
-from model import OneLayerModel, _parse_dtype
+from models.model import OneLayerModel, _parse_dtype
 from triton_compat import HAS_TRITON
-from decoder_moe import DecoderMoEConfig, DecoderMoEModel
-from transformer_decoder_model import TransformerDecoderConfig, TransformerDecoderModel
+from models.decoder_moe import DecoderMoEConfig, DecoderMoEModel
+from models.transformer_decoder_model import TransformerDecoderConfig, TransformerDecoderModel
 
 
 def _export_onnx_with_external_data(

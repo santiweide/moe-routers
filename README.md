@@ -4,10 +4,14 @@ This folder is **standalone**: it does **not** import anything from `vllm.*`.
 
 ## Files
 
-- `model.py`: model definition (`Linear + residual + custom op`)
+- `models/`: model definitions
+- `models/model.py`: 1-layer model definition (`Linear + residual + custom op`)
+- `models/transformer_decoder_model.py`: decoder-only Transformer
+- `models/decoder_moe.py`: decoder-only Transformer with MoE MLP
 - `run.py`: runnable entrypoint / benchmark for the model
 - `triton_compat.py`: optional Triton import shim (falls back to Torch when Triton is absent)
 - `export_netron.py`: export the model to a Netron-friendly ONNX pair
+- `kernels/`: C++/CUDA kernels (e.g. MoE router extension sources)
 - `requirements.txt`: minimal dependencies
 
 ## Run

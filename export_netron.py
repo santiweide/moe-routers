@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from model import OneLayerModel, _parse_dtype
+from models.model import OneLayerModel, _parse_dtype
 
 
 def _export_onnx_with_external_data(
