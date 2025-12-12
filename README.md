@@ -30,6 +30,12 @@ Run the Transformer decoder demo:
 python run.py --model transformer_decoder --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048
 ```
 
+Run the Decoder MoE demo (MLP replaced by MoE):
+
+```bash
+python run.py --model decoder_moe --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
+```
+
 ## Export (Netron-friendly ONNX)
 
 Export as an ONNX pair:
@@ -44,6 +50,12 @@ Export the Transformer decoder model:
 
 ```bash
 python run.py --model transformer_decoder --device cpu --dtype fp32 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --export_onnx_dir /tmp/netron_transformer
+```
+
+Export the Decoder MoE model:
+
+```bash
+python run.py --model decoder_moe --device cpu --dtype fp32 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2 --export_onnx_dir /tmp/netron_moe
 ```
 
 Open `__model__` in Netron.

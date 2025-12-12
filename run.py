@@ -24,6 +24,7 @@ import torch
 
 from model import OneLayerModel, _parse_dtype
 from triton_compat import HAS_TRITON
+from decoder_moe import DecoderMoEConfig, DecoderMoEModel
 from transformer_decoder_model import TransformerDecoderConfig, TransformerDecoderModel
 
 
@@ -88,7 +89,7 @@ def main() -> None:
         "--model",
         type=str,
         default="one_layer",
-        choices=["one_layer", "transformer_decoder"],
+        choices=["one_layer", "transformer_decoder", "decoder_moe"],
         help="Which model to run.",
     )
     parser.add_argument("--batch", type=int, default=8)
@@ -106,6 +107,8 @@ def main() -> None:
     parser.add_argument("--n_heads", type=int, default=8, help="(transformer_decoder) number of heads")
     parser.add_argument("--n_layers", type=int, default=6, help="(transformer_decoder) number of layers")
     parser.add_argument("--mlp_hidden_dim", type=int, default=2048, help="(transformer_decoder) MLP hidden dim")
+    parser.add_argument("--moe_n_experts", type=int, default=8, help="(decoder_moe) number of experts")
+    parser.add_argument("--moe_top_k", type=int, default=2, help="(decoder_moe) top-k routing")
     parser.add_argument(
         "--max_seq_len",
         type=int,
@@ -138,7 +141,7 @@ def main() -> None:
     if args.model == "one_layer":
         example = torch.randn(args.batch, args.hidden, device=device, dtype=dtype)
         model: torch.nn.Module = OneLayerModel(args.hidden).to(device=device, dtype=dtype).eval()
-    else:
+    elif args.model == "transformer_decoder":
         if args.seq_len <= 0:
             raise ValueError("--seq_len must be > 0")
         if args.vocab_size <= 0:
@@ -161,6 +164,35 @@ def main() -> None:
             dtype=torch.long,
         )
         model = TransformerDecoderModel(cfg).to(device=device, dtype=dtype).eval()
+    else:
+        if args.seq_len <= 0:
+            raise ValueError("--seq_len must be > 0")
+        if args.vocab_size <= 0:
+            raise ValueError("--vocab_size must be > 0")
+        if args.moe_n_experts <= 0:
+            raise ValueError("--moe_n_experts must be > 0")
+        if args.moe_top_k <= 0:
+            raise ValueError("--moe_top_k must be > 0")
+        cfg = DecoderMoEConfig(
+            vocab_size=args.vocab_size,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            moe_expert_hidden_dim=args.mlp_hidden_dim,
+            moe_n_experts=args.moe_n_experts,
+            moe_top_k=args.moe_top_k,
+            max_seq_len=args.max_seq_len,
+            absolute_pos_embedding=bool(args.absolute_pos_embedding),
+            rope=not bool(args.absolute_pos_embedding),
+        )
+        example = torch.randint(
+            low=0,
+            high=args.vocab_size,
+            size=(args.batch, args.seq_len),
+            device=device,
+            dtype=torch.long,
+        )
+        model = DecoderMoEModel(cfg).to(device=device, dtype=dtype).eval()
 
     # Warmup
     with torch.inference_mode():
@@ -211,7 +243,7 @@ def main() -> None:
                 output_names=["y"],
                 dynamic_axes={"x": {0: "batch"}, "y": {0: "batch"}},
             )
-        else:
+        elif args.model == "transformer_decoder":
             cfg = TransformerDecoderConfig(
                 vocab_size=args.vocab_size,
                 d_model=args.d_model,
@@ -223,6 +255,38 @@ def main() -> None:
                 rope=not bool(args.absolute_pos_embedding),
             )
             export_model = TransformerDecoderModel(cfg).to(device="cpu", dtype=export_dtype).eval()
+            export_ids = torch.randint(
+                low=0,
+                high=args.vocab_size,
+                size=(args.batch, args.seq_len),
+                device="cpu",
+                dtype=torch.long,
+            )
+            _export_onnx_with_external_data(
+                export_model,
+                export_ids,
+                export_dir,
+                input_names=["input_ids"],
+                output_names=["logits"],
+                dynamic_axes={
+                    "input_ids": {0: "batch", 1: "seq"},
+                    "logits": {0: "batch", 1: "seq"},
+                },
+            )
+        else:
+            cfg = DecoderMoEConfig(
+                vocab_size=args.vocab_size,
+                d_model=args.d_model,
+                n_heads=args.n_heads,
+                n_layers=args.n_layers,
+                moe_expert_hidden_dim=args.mlp_hidden_dim,
+                moe_n_experts=args.moe_n_experts,
+                moe_top_k=args.moe_top_k,
+                max_seq_len=args.max_seq_len,
+                absolute_pos_embedding=bool(args.absolute_pos_embedding),
+                rope=not bool(args.absolute_pos_embedding),
+            )
+            export_model = DecoderMoEModel(cfg).to(device="cpu", dtype=export_dtype).eval()
             export_ids = torch.randint(
                 low=0,
                 high=args.vocab_size,
