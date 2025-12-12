@@ -5,7 +5,7 @@ Export the 1-layer model to a Netron-friendly ONNX pair:
 - __params__  : external weights blob (single file)
 
 Run:
-  python standalone/minimal_layernum1_triton/export_netron.py --out_dir /tmp/netron_model --batch 2 --hidden 128 --dtype fp16
+  python export_netron.py --out_dir /tmp/netron_model --batch 2 --hidden 128 --dtype fp16
 
 Open in Netron:
   open the file "__model__" in the output directory.
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from run import OneLayerModel, _parse_dtype
+from model import OneLayerModel, _parse_dtype
 
 
 def _export_onnx_with_external_data(
@@ -43,6 +43,8 @@ def _export_onnx_with_external_data(
         input_names=["x"],
         output_names=["y"],
         dynamic_axes={"x": {0: "batch"}, "y": {0: "batch"}},
+        # Be conservative for maximum compatibility with python-side constructs.
+        dynamo=False,
     )
 
     # 2) Re-save with external data so we can split graph vs weights.
@@ -81,7 +83,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     # Export on CPU for maximum compatibility.
-    dtype = _parse_dtype(args.dtype)
+    # Note: some PyTorch CPU kernels may not support fp16/bf16; for ONNX export
+    # Netron doesn't care about runtime dtype, so we export in fp32 by default.
+    _ = _parse_dtype(args.dtype)  # keep arg validation
+    dtype = torch.float32
     model = OneLayerModel(args.hidden).to(device="cpu", dtype=dtype).eval()
     x = torch.randn(args.batch, args.hidden, device="cpu", dtype=dtype)
 
