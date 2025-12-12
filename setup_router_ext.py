@@ -20,7 +20,8 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="router_ext_cuda",
-            sources=["kernels/router_ext.cpp", "kernels/router_ext.cu"],
+            # IMPORTANT: basenames must be distinct or ninja will emit colliding .o files.
+            sources=["kernels/router_ext_bindings.cpp", "kernels/router_ext.cu"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "--use_fast_math"],
