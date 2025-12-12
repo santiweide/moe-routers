@@ -1,0 +1,7 @@
+# Minimal deps for this standalone demo.
+# - torch is required
+# - triton is optional (only needed if you want the Triton kernel path on CUDA)
+torch
+triton
+
+
