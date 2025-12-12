@@ -110,6 +110,13 @@ def main() -> None:
     parser.add_argument("--moe_n_experts", type=int, default=8, help="(decoder_moe) number of experts")
     parser.add_argument("--moe_top_k", type=int, default=2, help="(decoder_moe) top-k routing")
     parser.add_argument(
+        "--moe_router",
+        type=str,
+        default="torch",
+        choices=["torch", "cuda_ext"],
+        help="(decoder_moe) router backend: torch or CUDA extension (router_ext_cuda).",
+    )
+    parser.add_argument(
         "--max_seq_len",
         type=int,
         default=2048,
@@ -192,7 +199,7 @@ def main() -> None:
             device=device,
             dtype=torch.long,
         )
-        model = DecoderMoEModel(cfg).to(device=device, dtype=dtype).eval()
+        model = DecoderMoEModel(cfg, router_backend=args.moe_router).to(device=device, dtype=dtype).eval()
 
     # Warmup
     with torch.inference_mode():
@@ -286,7 +293,8 @@ def main() -> None:
                 absolute_pos_embedding=bool(args.absolute_pos_embedding),
                 rope=not bool(args.absolute_pos_embedding),
             )
-            export_model = DecoderMoEModel(cfg).to(device="cpu", dtype=export_dtype).eval()
+            # For export we force torch router (export path in MoE is dense anyway).
+            export_model = DecoderMoEModel(cfg, router_backend="torch").to(device="cpu", dtype=export_dtype).eval()
             export_ids = torch.randint(
                 low=0,
                 high=args.vocab_size,

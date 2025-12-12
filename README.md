@@ -36,6 +36,13 @@ Run the Decoder MoE demo (MLP replaced by MoE):
 python run.py --model decoder_moe --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
 ```
 
+Build and use the CUDA router extension (A100-friendly):
+
+```bash
+python setup_router_ext.py build_ext --inplace
+python run.py --model decoder_moe --moe_router cuda_ext --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
+```
+
 ## Export (Netron-friendly ONNX)
 
 Export as an ONNX pair:

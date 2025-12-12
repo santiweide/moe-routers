@@ -22,6 +22,57 @@ import torch.nn.functional as F
 from transformer_decoder_model import MaskedSelfAttention, RMSNorm, SwiGLU
 
 
+def _try_import_router_ext():
+    try:
+        import router_ext_cuda  # type: ignore
+
+        return router_ext_cuda
+    except Exception:
+        return None
+
+
+class RouterBase(torch.nn.Module):
+    """Interface: route logits -> (topk_idx[int64], topk_weight[float])"""
+
+    def forward(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: D401
+        raise NotImplementedError
+
+
+class TorchTopKRouter(RouterBase):
+    def forward(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_vals, topk_idx = torch.topk(logits, k=top_k, dim=-1)
+        topk_w = torch.softmax(topk_vals, dim=-1)
+        return topk_idx.to(torch.int64), topk_w
+
+
+class CUDATopKRouter(RouterBase):
+    """Uses the `router_ext_cuda` pybind/CUDA extension for top-k routing."""
+
+    def __init__(self):
+        super().__init__()
+        self._ext = _try_import_router_ext()
+
+    @property
+    def available(self) -> bool:
+        return self._ext is not None
+
+    def forward(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._ext is None:
+            # Fallback to torch if extension isn't built/available.
+            return TorchTopKRouter()(logits, top_k)
+        if (not logits.is_cuda) or torch.onnx.is_in_onnx_export():
+            return TorchTopKRouter()(logits, top_k)
+        # Extension supports k<=8; enforce here so errors are clearer.
+        if top_k > 8:
+            return TorchTopKRouter()(logits, top_k)
+        # Extension supports fp16/fp32/bf16 logits.
+        if logits.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+            return TorchTopKRouter()(logits, top_k)
+
+        idx_i32, w_f32 = self._ext.forward(logits, int(top_k))
+        return idx_i32.to(torch.int64), w_f32.to(dtype=logits.dtype)
+
+
 class MoELayer(torch.nn.Module):
     """
     Token-level MoE with top-k routing.
@@ -34,7 +85,15 @@ class MoELayer(torch.nn.Module):
     dense mixture over all experts (still a valid MoE, just not sparse).
     """
 
-    def __init__(self, d_model: int, expert_hidden_dim: int, n_experts: int, top_k: int = 2):
+    def __init__(
+        self,
+        d_model: int,
+        expert_hidden_dim: int,
+        n_experts: int,
+        top_k: int = 2,
+        *,
+        router_impl: Optional[RouterBase] = None,
+    ):
         super().__init__()
         if n_experts <= 0:
             raise ValueError("n_experts must be > 0")
@@ -46,6 +105,7 @@ class MoELayer(torch.nn.Module):
         self.n_experts = n_experts
         self.top_k = top_k
         self.router = torch.nn.Linear(d_model, n_experts, bias=False)
+        self.router_impl: RouterBase = router_impl if router_impl is not None else TorchTopKRouter()
         self.experts = torch.nn.ModuleList(
             [SwiGLU(d_model=d_model, hidden_dim=expert_hidden_dim) for _ in range(n_experts)]
         )
@@ -65,9 +125,8 @@ class MoELayer(torch.nn.Module):
                 out = out + expert_out * gates[:, e : e + 1]
             return out.view(bsz, seq_len, d_model)
 
-        # Sparse top-k MoE for regular execution.
-        topk_vals, topk_idx = torch.topk(router_logits, k=self.top_k, dim=-1)  # [S, K], [S, K]
-        topk_w = torch.softmax(topk_vals, dim=-1)  # [S, K]
+        # Sparse top-k MoE for regular execution (router implementation is pluggable).
+        topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
 
         out = torch.zeros_like(flat)
         # Dispatch per expert per top-k slot (simple/reference implementation).
@@ -96,6 +155,7 @@ class DecoderMoEBlock(torch.nn.Module):
         rope_base: float = 10000.0,
         norm_eps: float = 1e-6,
         attn_dropout_p: float = 0.0,
+        router_impl: Optional[RouterBase] = None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(d_model, eps=norm_eps)
@@ -112,6 +172,7 @@ class DecoderMoEBlock(torch.nn.Module):
             expert_hidden_dim=moe_expert_hidden_dim,
             n_experts=moe_n_experts,
             top_k=moe_top_k,
+            router_impl=router_impl,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -145,9 +206,16 @@ class DecoderMoEConfig:
 class DecoderMoEModel(torch.nn.Module):
     """Decoder-only Transformer where the MLP sub-layer is replaced by MoE."""
 
-    def __init__(self, cfg: DecoderMoEConfig):
+    def __init__(self, cfg: DecoderMoEConfig, *, router_backend: str = "torch"):
         super().__init__()
         self.cfg = cfg
+        if router_backend not in {"torch", "cuda_ext"}:
+            raise ValueError("router_backend must be one of: 'torch', 'cuda_ext'")
+        router_impl: Optional[RouterBase]
+        if router_backend == "cuda_ext":
+            router_impl = CUDATopKRouter()
+        else:
+            router_impl = TorchTopKRouter()
 
         # Phase 1: Input & Embedding
         self.tok_embed = torch.nn.Embedding(cfg.vocab_size, cfg.d_model)
@@ -168,6 +236,7 @@ class DecoderMoEModel(torch.nn.Module):
                     rope_base=cfg.rope_base,
                     norm_eps=cfg.norm_eps,
                     attn_dropout_p=cfg.attn_dropout_p,
+                    router_impl=router_impl,
                 )
                 for _ in range(cfg.n_layers)
             ]
