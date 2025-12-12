@@ -22,20 +22,11 @@ __device__ __forceinline__ float to_float<at::Half>(at::Half v) {
   return __half2float(reinterpret_cast<const __half&>(v));
 }
 
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
 template <>
 __device__ __forceinline__ float to_float<at::BFloat16>(at::BFloat16 v) {
-#if (__CUDA_ARCH__ >= 800) || !defined(__CUDA_ARCH__)
-  // A100 supports bf16 natively.
-  __nv_bfloat16 bv;
-  bv.x = v.x;
-  return __bfloat162float(bv);
-#else
-  // Fallback (shouldn't be hit on A100).
+  // Use ATen's bf16 conversion; avoids depending on __nv_bfloat16 internal layout.
   return static_cast<float>(v);
-#endif
 }
-#endif
 
 __device__ __forceinline__ void insert_topk(float val, int idx, float* topv, int* topi, int k) {
   // Keep arrays sorted descending.
