@@ -19,30 +19,20 @@ from typing import Optional
 import torch
 
 from .transformer_decoder_model import MaskedSelfAttention, RMSNorm, SwiGLU
-
-
-@dataclass
-class MoERouterMetrics:
-    router_backend: str
-    tokens: int
-    experts: int
-    top_k: int
-    routes: int
-    router_overhead_ms: float
-    avg_active_experts_per_token: float
-    active_experts: int
-    active_expert_fraction: float
-    top1_route_fraction: float
-    normalized_entropy: float
-    route_sparsity: float
-    load_mean: float
-    load_std: float
-    load_cv: float
-    load_max_over_mean: float
-    load_min_over_mean: float
-    # Optional (may be skipped for very large R)
-    unique_tokens_per_expert_mean: Optional[float] = None
-    unique_tokens_per_expert_std: Optional[float] = None
+from .metrics import (
+    MoEMetrics,
+    PerformanceEfficiencyMetrics,
+    RoutingBehaviorMetrics,
+    ExpertUsageMetrics,
+    avg_unique_experts_per_token,
+    aux_load_balance_loss,
+    mean_topk_probability_from_logits,
+    normalized_entropy,
+    output_distribution_stats,
+    route_distribution_from_topk,
+    routing_entropy_from_distribution,
+    unique_tokens_per_expert,
+)
 
 
 def _try_import_router_ext():
@@ -196,89 +186,13 @@ class MoELayer(torch.nn.Module):
         self.router = torch.nn.Linear(d_model, n_experts, bias=False)
         self.router_impl: RouterBase = router_impl if router_impl is not None else TorchTopKRouter()
         self.track_metrics = track_metrics
-        self._last_metrics: Optional[MoERouterMetrics] = None
+        self._last_metrics: Optional[MoEMetrics] = None
         self.experts = torch.nn.ModuleList(
             [SwiGLU(d_model=d_model, hidden_dim=expert_hidden_dim) for _ in range(n_experts)]
         )
 
-    def get_last_metrics(self) -> Optional[MoERouterMetrics]:
+    def get_last_metrics(self) -> Optional[MoEMetrics]:
         return self._last_metrics
-
-    def _compute_metrics(
-        self,
-        *,
-        topk_idx: torch.Tensor,
-        router_overhead_ms: float,
-    ) -> MoERouterMetrics:
-        # topk_idx: [S, K] int64
-        s, k = topk_idx.shape
-        e = self.n_experts
-        routes = int(s * k)
-
-        # Average unique experts per token (handles accidental duplicates).
-        if k == 1:
-            avg_active = 1.0
-        else:
-            sorted_idx = torch.sort(topk_idx, dim=-1).values
-            uniq = 1 + (sorted_idx[:, 1:] != sorted_idx[:, :-1]).to(torch.int32).sum(dim=-1)
-            avg_active = float(uniq.float().mean().item())
-
-        expert_ids = topk_idx.reshape(-1)
-        counts = torch.bincount(expert_ids, minlength=e).to(torch.float32)  # routes per expert
-        active = int((counts > 0).sum().item())
-        active_frac = float(active / max(e, 1))
-        p = counts / max(routes, 1)
-        top1 = float(p.max().item()) if routes > 0 else 0.0
-        # Entropy in [0, log(E)] -> normalize to [0,1]
-        eps = 1e-12
-        entropy = -(p[p > 0] * (p[p > 0] + eps).log()).sum()
-        norm_entropy = float((entropy / max(torch.log(torch.tensor(float(e))), torch.tensor(1.0))).item())
-        route_sparsity = 1.0 - norm_entropy
-
-        mean = float(counts.mean().item()) if e > 0 else 0.0
-        std = float(counts.std(unbiased=False).item()) if e > 0 else 0.0
-        cv = float(std / (mean + 1e-9))
-        max_over_mean = float((counts.max().item() / (mean + 1e-9))) if e > 0 else 0.0
-        min_over_mean = float((counts.min().item() / (mean + 1e-9))) if e > 0 else 0.0
-
-        unique_mean: Optional[float] = None
-        unique_std: Optional[float] = None
-        # Token-to-expert utilization: unique tokens per expert (skip if huge).
-        if routes <= 1_000_000:
-            token_ids = (
-                torch.arange(s, device=topk_idx.device, dtype=torch.int64)
-                .unsqueeze(1)
-                .expand(s, k)
-                .reshape(-1)
-            )
-            enc = token_ids * e + expert_ids
-            enc_u = torch.unique(enc)
-            expert_u = (enc_u % e).to(torch.int64)
-            tok_counts = torch.bincount(expert_u, minlength=e).to(torch.float32)
-            unique_mean = float(tok_counts.mean().item())
-            unique_std = float(tok_counts.std(unbiased=False).item())
-
-        return MoERouterMetrics(
-            router_backend=self.router_impl.name,
-            tokens=int(s),
-            experts=int(e),
-            top_k=int(k),
-            routes=int(routes),
-            router_overhead_ms=float(router_overhead_ms),
-            avg_active_experts_per_token=float(avg_active),
-            active_experts=int(active),
-            active_expert_fraction=float(active_frac),
-            top1_route_fraction=float(top1),
-            normalized_entropy=float(norm_entropy),
-            route_sparsity=float(route_sparsity),
-            load_mean=float(mean),
-            load_std=float(std),
-            load_cv=float(cv),
-            load_max_over_mean=float(max_over_mean),
-            load_min_over_mean=float(min_over_mean),
-            unique_tokens_per_expert_mean=unique_mean,
-            unique_tokens_per_expert_std=unique_std,
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, d_model]
@@ -300,24 +214,26 @@ class MoELayer(torch.nn.Module):
         # Optimization: token bucketing + per-expert batched GEMM.
         # We expand routes (token, expert, weight) -> sort by expert -> run one
         # expert MLP per contiguous bucket -> index_add back to token outputs.
-        router_overhead_ms = 0.0
+        # Timings:
+        # - total MoE time: router + dispatch + expert MLPs + combine
+        # - router time: just router_impl()
+        total_ms = 0.0
+        router_ms = 0.0
+        expert_ms = 0.0
+
         if self.track_metrics and x.is_cuda:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
+            total_start = torch.cuda.Event(enable_timing=True)
+            router_start = torch.cuda.Event(enable_timing=True)
+            router_end = torch.cuda.Event(enable_timing=True)
+            expert_end = torch.cuda.Event(enable_timing=True)
+            total_end = torch.cuda.Event(enable_timing=True)
+
+            total_start.record()
+            router_start.record()
             topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
-            end.record()
-            torch.cuda.synchronize()
-            router_overhead_ms = float(start.elapsed_time(end))
+            router_end.record()
         else:
             topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
-
-        if self.track_metrics:
-            # Ensure int64 for metrics computations.
-            self._last_metrics = self._compute_metrics(
-                topk_idx=topk_idx.to(torch.int64),
-                router_overhead_ms=router_overhead_ms,
-            )
 
         s = flat.size(0)
         k = self.top_k
@@ -355,6 +271,81 @@ class MoELayer(torch.nn.Module):
             out.index_add_(0, tok_e, y_e)
 
             start = end
+
+        if self.track_metrics and x.is_cuda:
+            expert_end.record()
+            total_end.record()
+            torch.cuda.synchronize()
+            total_ms = float(total_start.elapsed_time(total_end))
+            router_ms = float(router_start.elapsed_time(router_end))
+            expert_ms = float(router_end.elapsed_time(expert_end))
+
+        if self.track_metrics:
+            # Routing behavior metrics derived from top-k indices + full softmax probs.
+            topk_i64 = topk_idx.to(torch.int64)
+            p_route = route_distribution_from_topk(topk_i64, self.n_experts)  # [E]
+            h = routing_entropy_from_distribution(p_route)
+            h_norm = normalized_entropy(p_route)
+
+            mean_topk_prob = mean_topk_probability_from_logits(router_logits, k)
+            top1_frac = float(p_route.max().item()) if p_route.numel() > 0 else 0.0
+
+            # Expert usage / load balance
+            counts_f = (p_route * float(max(s * k, 1))).to(torch.float32)  # back to route counts for stats
+            load_mean = float(counts_f.mean().item()) if counts_f.numel() > 0 else 0.0
+            load_std = float(counts_f.std(unbiased=False).item()) if counts_f.numel() > 0 else 0.0
+            load_cv = float(load_std / (load_mean + 1e-9))
+            load_max_over_mean = float((counts_f.max().item() / (load_mean + 1e-9))) if counts_f.numel() > 0 else 0.0
+            load_min_over_mean = float((counts_f.min().item() / (load_mean + 1e-9))) if counts_f.numel() > 0 else 0.0
+            active = int((counts_f > 0).sum().item())
+            dead = int(self.n_experts - active)
+
+            # Importance from full softmax probability mass.
+            probs_full = torch.softmax(router_logits.float(), dim=-1)  # [S, E]
+            importance = probs_full.mean(dim=0).to(torch.float32)  # [E]
+            aux = aux_load_balance_loss(route_frac=p_route.to(torch.float32), importance=importance, alpha=1.0)
+
+            uniq_stats = unique_tokens_per_expert(topk_i64, self.n_experts)
+            unique_mean = uniq_stats[0] if uniq_stats is not None else None
+            unique_std = uniq_stats[1] if uniq_stats is not None else None
+
+            perf = PerformanceEfficiencyMetrics(
+                tokens=int(s),
+                total_moe_ms=float(total_ms),
+                router_ms=float(router_ms),
+                expert_ms=float(expert_ms),
+                token_latency_us=float((total_ms * 1000.0) / max(s, 1)),
+            )
+            routing = RoutingBehaviorMetrics(
+                routing_entropy=float(h),
+                normalized_entropy=float(h_norm),
+                mean_topk_probability=float(mean_topk_prob),
+                top1_route_fraction=float(top1_frac),
+                route_distribution=p_route.detach().cpu(),
+                per_token_prob_sample=probs_full[0].detach().cpu() if probs_full.numel() else None,
+            )
+            usage = ExpertUsageMetrics(
+                active_experts=int(active),
+                active_expert_fraction=float(active / max(self.n_experts, 1)),
+                avg_active_experts_per_token=float(avg_unique_experts_per_token(topk_i64)),
+                load_mean_routes=float(load_mean),
+                load_std_routes=float(load_std),
+                load_cv=float(load_cv),
+                load_max_over_mean=float(load_max_over_mean),
+                load_min_over_mean=float(load_min_over_mean),
+                dead_experts=int(dead),
+                aux_load_balance_loss=float(aux),
+                unique_tokens_per_expert_mean=unique_mean,
+                unique_tokens_per_expert_std=unique_std,
+            )
+            out_stats = output_distribution_stats(out)
+            self._last_metrics = MoEMetrics(
+                router_backend=self.router_impl.name,
+                performance=perf,
+                routing=routing,
+                usage=usage,
+                output=out_stats,
+            )
 
         return out.view(bsz, seq_len, d_model)
 
@@ -499,7 +490,7 @@ class DecoderMoEModel(torch.nn.Module):
         x = self.final_norm(x)
         return self.lm_head(x)  # [B, T, vocab]
 
-    def get_last_router_metrics(self) -> Optional[MoERouterMetrics]:
+    def get_last_router_metrics(self) -> Optional[MoEMetrics]:
         # Report metrics from the first block's MoE layer (representative).
         if not self.blocks:
             return None
@@ -575,7 +566,6 @@ __all__ = [
     "DecoderMoEConfig",
     "DecoderMoEModel",
     "MoELayer",
-    "MoERouterMetrics",
     "SinkhornRouter",
 ]
 

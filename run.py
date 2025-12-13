@@ -257,21 +257,32 @@ def main() -> None:
     if args.model == "decoder_moe" and args.moe_metrics:
         m = model.get_last_router_metrics()  # type: ignore[attr-defined]
         if m is not None:
-            print("MoE Router Metrics:")
+            print("MoE Metrics:")
             print("  router_backend:", m.router_backend)
-            print("  router_overhead_ms:", m.router_overhead_ms)
-            print("  avg_active_experts_per_token:", m.avg_active_experts_per_token)
-            print("  active_experts:", m.active_experts, f"({m.active_expert_fraction:.3f} of total)")
-            print("  route_sparsity(1-norm_entropy):", m.route_sparsity)
-            print("  top1_route_fraction:", m.top1_route_fraction)
-            print("  load_mean(routes/expert):", m.load_mean)
-            print("  load_std:", m.load_std)
-            print("  load_cv:", m.load_cv)
-            print("  load_max_over_mean:", m.load_max_over_mean)
-            print("  load_min_over_mean:", m.load_min_over_mean)
-            if m.unique_tokens_per_expert_mean is not None:
-                print("  unique_tokens_per_expert_mean:", m.unique_tokens_per_expert_mean)
-                print("  unique_tokens_per_expert_std:", m.unique_tokens_per_expert_std)
+            print("  token_latency_us:", m.performance.token_latency_us)
+            print("  total_moe_ms:", m.performance.total_moe_ms)
+            print("  router_ms:", m.performance.router_ms)
+            print("  expert_ms:", m.performance.expert_ms)
+            print("  routing_entropy(nats):", m.routing.routing_entropy)
+            print("  normalized_entropy:", m.routing.normalized_entropy)
+            print("  mean_topk_probability:", m.routing.mean_topk_probability)
+            print("  top1_route_fraction:", m.routing.top1_route_fraction)
+            print("  avg_active_experts_per_token:", m.usage.avg_active_experts_per_token)
+            print("  active_experts:", m.usage.active_experts, f"({m.usage.active_expert_fraction:.3f} of total)")
+            print("  dead_experts:", m.usage.dead_experts)
+            print("  aux_load_balance_loss:", m.usage.aux_load_balance_loss)
+            print("  load_mean_routes:", m.usage.load_mean_routes)
+            print("  load_std_routes:", m.usage.load_std_routes)
+            print("  load_cv:", m.usage.load_cv)
+            print("  load_max_over_mean:", m.usage.load_max_over_mean)
+            print("  load_min_over_mean:", m.usage.load_min_over_mean)
+            if m.usage.unique_tokens_per_expert_mean is not None:
+                print("  unique_tokens_per_expert_mean:", m.usage.unique_tokens_per_expert_mean)
+                print("  unique_tokens_per_expert_std:", m.usage.unique_tokens_per_expert_std)
+            print("  moe_output_mean:", m.output.output_mean)
+            print("  moe_output_var:", m.output.output_var)
+            print("  moe_output_std:", m.output.output_std)
+            print("  moe_output_absmax:", m.output.output_absmax)
 
     if args.export_onnx_dir:
         # Export on CPU for maximum compatibility.

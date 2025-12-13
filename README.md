@@ -47,6 +47,8 @@ python run.py --model decoder_moe --moe_router torch --moe_metrics --device cuda
 python run.py --model decoder_moe --moe_router cuda_ext --moe_metrics --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
 ```
 
+Note: for per-token latency style benchmarking, use `--batch 1` (and often `--seq_len 1`) to isolate token-level overhead.
+
 Compare with Sinkhorn (balanced) routing:
 
 ```bash
