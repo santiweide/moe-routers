@@ -40,6 +40,19 @@ Run the Decoder MoE demo (MLP replaced by MoE):
 python run.py --model decoder_moe --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
 ```
 
+Compare router metrics (torch vs cuda_ext):
+
+```bash
+python run.py --model decoder_moe --moe_router torch --moe_metrics --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
+python run.py --model decoder_moe --moe_router cuda_ext --moe_metrics --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
+```
+
+Compare with Sinkhorn (balanced) routing:
+
+```bash
+python run.py --model decoder_moe --moe_router sinkhorn --sinkhorn_iters 10 --sinkhorn_temperature 1.0 --moe_metrics --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
+```
+
 Build and use the CUDA router extension (A100-friendly):
 
 ```bash

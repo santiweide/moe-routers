@@ -21,6 +21,30 @@ import torch
 from .transformer_decoder_model import MaskedSelfAttention, RMSNorm, SwiGLU
 
 
+@dataclass
+class MoERouterMetrics:
+    router_backend: str
+    tokens: int
+    experts: int
+    top_k: int
+    routes: int
+    router_overhead_ms: float
+    avg_active_experts_per_token: float
+    active_experts: int
+    active_expert_fraction: float
+    top1_route_fraction: float
+    normalized_entropy: float
+    route_sparsity: float
+    load_mean: float
+    load_std: float
+    load_cv: float
+    load_max_over_mean: float
+    load_min_over_mean: float
+    # Optional (may be skipped for very large R)
+    unique_tokens_per_expert_mean: Optional[float] = None
+    unique_tokens_per_expert_std: Optional[float] = None
+
+
 def _try_import_router_ext():
     try:
         import router_ext_cuda  # type: ignore
@@ -36,12 +60,77 @@ class RouterBase(torch.nn.Module):
     def forward(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: D401
         raise NotImplementedError
 
+    @property
+    def name(self) -> str:
+        return self.__class__.__name__
+
 
 class TorchTopKRouter(RouterBase):
     def forward(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         topk_vals, topk_idx = torch.topk(logits, k=top_k, dim=-1)
         topk_w = torch.softmax(topk_vals, dim=-1)
         return topk_idx.to(torch.int64), topk_w
+
+
+class SinkhornRouter(RouterBase):
+    """
+    Sinkhorn-Knopp router (reference implementation, Torch-only).
+
+    Idea:
+    - Convert router logits -> nonnegative matrix Q (tokens x experts)
+    - Run Sinkhorn iterations to approximately enforce:
+        row sums ~= 1          (each token distributes prob mass)
+        col sums ~= S/E        (balanced expert load)
+    - Select top-k experts per token from the resulting assignment matrix.
+
+    This is mainly for *analysis/quality/load-balance* comparisons, not speed.
+    Complexity is O(iters * S * E).
+    """
+
+    def __init__(self, *, iters: int = 10, epsilon: float = 1e-6, temperature: float = 1.0):
+        super().__init__()
+        if iters <= 0:
+            raise ValueError("SinkhornRouter.iters must be > 0")
+        if epsilon <= 0:
+            raise ValueError("SinkhornRouter.epsilon must be > 0")
+        if temperature <= 0:
+            raise ValueError("SinkhornRouter.temperature must be > 0")
+        self.iters = int(iters)
+        self.epsilon = float(epsilon)
+        self.temperature = float(temperature)
+
+    def forward(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # logits: [S, E]
+        if logits.dim() != 2:
+            raise ValueError("SinkhornRouter expects logits of shape [tokens, experts]")
+        s, e = logits.shape
+        if top_k <= 0:
+            raise ValueError("top_k must be > 0")
+        if top_k > e:
+            raise ValueError("top_k must be <= n_experts")
+
+        # Use fp32 for numerical stability.
+        scores = (logits / self.temperature).float()
+        # Exponentiate with stabilization.
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+        q = torch.exp(scores)
+
+        # Target column sum: S / E (balanced load), row sum: 1.
+        col_target = float(s) / float(max(e, 1))
+        eps = self.epsilon
+
+        for _ in range(self.iters):
+            # Normalize rows to sum to 1.
+            q = q / (q.sum(dim=1, keepdim=True) + eps)
+            # Normalize cols to sum to col_target.
+            q = q / (q.sum(dim=0, keepdim=True) + eps) * col_target
+
+        # Final row renorm to get probabilities per token.
+        q = q / (q.sum(dim=1, keepdim=True) + eps)
+
+        vals, idx = torch.topk(q, k=top_k, dim=-1)  # [S, K]
+        w = vals / (vals.sum(dim=-1, keepdim=True) + eps)
+        return idx.to(torch.int64), w.to(dtype=logits.dtype)
 
 
 class CUDATopKRouter(RouterBase):
@@ -92,6 +181,7 @@ class MoELayer(torch.nn.Module):
         top_k: int = 2,
         *,
         router_impl: Optional[RouterBase] = None,
+        track_metrics: bool = False,
     ):
         super().__init__()
         if n_experts <= 0:
@@ -105,8 +195,89 @@ class MoELayer(torch.nn.Module):
         self.top_k = top_k
         self.router = torch.nn.Linear(d_model, n_experts, bias=False)
         self.router_impl: RouterBase = router_impl if router_impl is not None else TorchTopKRouter()
+        self.track_metrics = track_metrics
+        self._last_metrics: Optional[MoERouterMetrics] = None
         self.experts = torch.nn.ModuleList(
             [SwiGLU(d_model=d_model, hidden_dim=expert_hidden_dim) for _ in range(n_experts)]
+        )
+
+    def get_last_metrics(self) -> Optional[MoERouterMetrics]:
+        return self._last_metrics
+
+    def _compute_metrics(
+        self,
+        *,
+        topk_idx: torch.Tensor,
+        router_overhead_ms: float,
+    ) -> MoERouterMetrics:
+        # topk_idx: [S, K] int64
+        s, k = topk_idx.shape
+        e = self.n_experts
+        routes = int(s * k)
+
+        # Average unique experts per token (handles accidental duplicates).
+        if k == 1:
+            avg_active = 1.0
+        else:
+            sorted_idx = torch.sort(topk_idx, dim=-1).values
+            uniq = 1 + (sorted_idx[:, 1:] != sorted_idx[:, :-1]).to(torch.int32).sum(dim=-1)
+            avg_active = float(uniq.float().mean().item())
+
+        expert_ids = topk_idx.reshape(-1)
+        counts = torch.bincount(expert_ids, minlength=e).to(torch.float32)  # routes per expert
+        active = int((counts > 0).sum().item())
+        active_frac = float(active / max(e, 1))
+        p = counts / max(routes, 1)
+        top1 = float(p.max().item()) if routes > 0 else 0.0
+        # Entropy in [0, log(E)] -> normalize to [0,1]
+        eps = 1e-12
+        entropy = -(p[p > 0] * (p[p > 0] + eps).log()).sum()
+        norm_entropy = float((entropy / max(torch.log(torch.tensor(float(e))), torch.tensor(1.0))).item())
+        route_sparsity = 1.0 - norm_entropy
+
+        mean = float(counts.mean().item()) if e > 0 else 0.0
+        std = float(counts.std(unbiased=False).item()) if e > 0 else 0.0
+        cv = float(std / (mean + 1e-9))
+        max_over_mean = float((counts.max().item() / (mean + 1e-9))) if e > 0 else 0.0
+        min_over_mean = float((counts.min().item() / (mean + 1e-9))) if e > 0 else 0.0
+
+        unique_mean: Optional[float] = None
+        unique_std: Optional[float] = None
+        # Token-to-expert utilization: unique tokens per expert (skip if huge).
+        if routes <= 1_000_000:
+            token_ids = (
+                torch.arange(s, device=topk_idx.device, dtype=torch.int64)
+                .unsqueeze(1)
+                .expand(s, k)
+                .reshape(-1)
+            )
+            enc = token_ids * e + expert_ids
+            enc_u = torch.unique(enc)
+            expert_u = (enc_u % e).to(torch.int64)
+            tok_counts = torch.bincount(expert_u, minlength=e).to(torch.float32)
+            unique_mean = float(tok_counts.mean().item())
+            unique_std = float(tok_counts.std(unbiased=False).item())
+
+        return MoERouterMetrics(
+            router_backend=self.router_impl.name,
+            tokens=int(s),
+            experts=int(e),
+            top_k=int(k),
+            routes=int(routes),
+            router_overhead_ms=float(router_overhead_ms),
+            avg_active_experts_per_token=float(avg_active),
+            active_experts=int(active),
+            active_expert_fraction=float(active_frac),
+            top1_route_fraction=float(top1),
+            normalized_entropy=float(norm_entropy),
+            route_sparsity=float(route_sparsity),
+            load_mean=float(mean),
+            load_std=float(std),
+            load_cv=float(cv),
+            load_max_over_mean=float(max_over_mean),
+            load_min_over_mean=float(min_over_mean),
+            unique_tokens_per_expert_mean=unique_mean,
+            unique_tokens_per_expert_std=unique_std,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -129,7 +300,24 @@ class MoELayer(torch.nn.Module):
         # Optimization: token bucketing + per-expert batched GEMM.
         # We expand routes (token, expert, weight) -> sort by expert -> run one
         # expert MLP per contiguous bucket -> index_add back to token outputs.
-        topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
+        router_overhead_ms = 0.0
+        if self.track_metrics and x.is_cuda:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
+            end.record()
+            torch.cuda.synchronize()
+            router_overhead_ms = float(start.elapsed_time(end))
+        else:
+            topk_idx, topk_w = self.router_impl(router_logits, self.top_k)  # [S, K], [S, K]
+
+        if self.track_metrics:
+            # Ensure int64 for metrics computations.
+            self._last_metrics = self._compute_metrics(
+                topk_idx=topk_idx.to(torch.int64),
+                router_overhead_ms=router_overhead_ms,
+            )
 
         s = flat.size(0)
         k = self.top_k
@@ -185,6 +373,7 @@ class DecoderMoEBlock(torch.nn.Module):
         norm_eps: float = 1e-6,
         attn_dropout_p: float = 0.0,
         router_impl: Optional[RouterBase] = None,
+        track_metrics: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(d_model, eps=norm_eps)
@@ -202,6 +391,7 @@ class DecoderMoEBlock(torch.nn.Module):
             n_experts=moe_n_experts,
             top_k=moe_top_k,
             router_impl=router_impl,
+            track_metrics=track_metrics,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -235,14 +425,27 @@ class DecoderMoEConfig:
 class DecoderMoEModel(torch.nn.Module):
     """Decoder-only Transformer where the MLP sub-layer is replaced by MoE."""
 
-    def __init__(self, cfg: DecoderMoEConfig, *, router_backend: str = "torch"):
+    def __init__(
+        self,
+        cfg: DecoderMoEConfig,
+        *,
+        router_backend: str = "torch",
+        track_metrics: bool = False,
+        sinkhorn_iters: int = 10,
+        sinkhorn_epsilon: float = 1e-6,
+        sinkhorn_temperature: float = 1.0,
+    ):
         super().__init__()
         self.cfg = cfg
-        if router_backend not in {"torch", "cuda_ext"}:
-            raise ValueError("router_backend must be one of: 'torch', 'cuda_ext'")
+        if router_backend not in {"torch", "cuda_ext", "sinkhorn"}:
+            raise ValueError("router_backend must be one of: 'torch', 'cuda_ext', 'sinkhorn'")
         router_impl: Optional[RouterBase]
         if router_backend == "cuda_ext":
             router_impl = CUDATopKRouter()
+        elif router_backend == "sinkhorn":
+            router_impl = SinkhornRouter(
+                iters=sinkhorn_iters, epsilon=sinkhorn_epsilon, temperature=sinkhorn_temperature
+            )
         else:
             router_impl = TorchTopKRouter()
 
@@ -266,6 +469,7 @@ class DecoderMoEModel(torch.nn.Module):
                     norm_eps=cfg.norm_eps,
                     attn_dropout_p=cfg.attn_dropout_p,
                     router_impl=router_impl,
+                    track_metrics=track_metrics,
                 )
                 for _ in range(cfg.n_layers)
             ]
@@ -294,6 +498,15 @@ class DecoderMoEModel(torch.nn.Module):
 
         x = self.final_norm(x)
         return self.lm_head(x)  # [B, T, vocab]
+
+    def get_last_router_metrics(self) -> Optional[MoERouterMetrics]:
+        # Report metrics from the first block's MoE layer (representative).
+        if not self.blocks:
+            return None
+        moe = getattr(self.blocks[0], "moe", None)
+        if moe is None:
+            return None
+        return moe.get_last_metrics()
 
     @torch.no_grad()
     def generate(
@@ -362,6 +575,8 @@ __all__ = [
     "DecoderMoEConfig",
     "DecoderMoEModel",
     "MoELayer",
+    "MoERouterMetrics",
+    "SinkhornRouter",
 ]
 
 

@@ -113,8 +113,20 @@ def main() -> None:
         "--moe_router",
         type=str,
         default="torch",
-        choices=["torch", "cuda_ext"],
-        help="(decoder_moe) router backend: torch or CUDA extension (router_ext_cuda).",
+        choices=["torch", "cuda_ext", "sinkhorn"],
+        help="(decoder_moe) router backend: torch, CUDA extension (router_ext_cuda), or sinkhorn (balanced routing).",
+    )
+    parser.add_argument("--sinkhorn_iters", type=int, default=10, help="(decoder_moe, sinkhorn) Sinkhorn iterations")
+    parser.add_argument(
+        "--sinkhorn_epsilon", type=float, default=1e-6, help="(decoder_moe, sinkhorn) numerical epsilon"
+    )
+    parser.add_argument(
+        "--sinkhorn_temperature", type=float, default=1.0, help="(decoder_moe, sinkhorn) router temperature"
+    )
+    parser.add_argument(
+        "--moe_metrics",
+        action="store_true",
+        help="(decoder_moe) collect and print MoE routing metrics (overhead/sparsity/utilization/load balance).",
     )
     parser.add_argument(
         "--max_seq_len",
@@ -199,7 +211,18 @@ def main() -> None:
             device=device,
             dtype=torch.long,
         )
-        model = DecoderMoEModel(cfg, router_backend=args.moe_router).to(device=device, dtype=dtype).eval()
+        model = (
+            DecoderMoEModel(
+                cfg,
+                router_backend=args.moe_router,
+                track_metrics=bool(args.moe_metrics),
+                sinkhorn_iters=args.sinkhorn_iters,
+                sinkhorn_epsilon=args.sinkhorn_epsilon,
+                sinkhorn_temperature=args.sinkhorn_temperature,
+            )
+            .to(device=device, dtype=dtype)
+            .eval()
+        )
 
     # Warmup
     with torch.inference_mode():
@@ -231,6 +254,24 @@ def main() -> None:
         print("logits:", tuple(y.shape))
         print("logits.mean:", float(y.float().mean().cpu()))
     print("latency_ms/iter:", (t1 - t0) * 1000.0 / max(args.iters, 1))
+    if args.model == "decoder_moe" and args.moe_metrics:
+        m = model.get_last_router_metrics()  # type: ignore[attr-defined]
+        if m is not None:
+            print("MoE Router Metrics:")
+            print("  router_backend:", m.router_backend)
+            print("  router_overhead_ms:", m.router_overhead_ms)
+            print("  avg_active_experts_per_token:", m.avg_active_experts_per_token)
+            print("  active_experts:", m.active_experts, f"({m.active_expert_fraction:.3f} of total)")
+            print("  route_sparsity(1-norm_entropy):", m.route_sparsity)
+            print("  top1_route_fraction:", m.top1_route_fraction)
+            print("  load_mean(routes/expert):", m.load_mean)
+            print("  load_std:", m.load_std)
+            print("  load_cv:", m.load_cv)
+            print("  load_max_over_mean:", m.load_max_over_mean)
+            print("  load_min_over_mean:", m.load_min_over_mean)
+            if m.unique_tokens_per_expert_mean is not None:
+                print("  unique_tokens_per_expert_mean:", m.unique_tokens_per_expert_mean)
+                print("  unique_tokens_per_expert_std:", m.unique_tokens_per_expert_std)
 
     if args.export_onnx_dir:
         # Export on CPU for maximum compatibility.
