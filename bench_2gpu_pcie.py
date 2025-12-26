@@ -124,6 +124,18 @@ def main() -> None:
     p.add_argument("--experts", type=int, default=64, help="E (global experts)")
     p.add_argument("--top_k", type=int, default=2)
     p.add_argument(
+        "--strategies",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Run multiple strategies and print a comparison table on rank0 (overrides --strategy).",
+    )
+    p.add_argument(
+        "--all_strategies",
+        action="store_true",
+        help="Run all supported strategies: naive_topk, fused_select (B), sinkhorn (C).",
+    )
+    p.add_argument(
         "--strategy",
         type=str,
         default="naive_topk",
@@ -167,17 +179,32 @@ def main() -> None:
     torch_router = TorchTopKRouter()
     sinkhorn_router = SinkhornRouter(iters=args.sinkhorn_iters, temperature=args.sinkhorn_temperature)
 
-    def route_select(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
+    strategies_all = ["naive_topk", "fused_select", "sinkhorn"]
+    if args.all_strategies:
+        strategies = strategies_all
+    elif args.strategies is not None:
+        strategies = args.strategies
+    else:
+        strategies = [args.strategy]
+
+    unknown = [s for s in strategies if s not in strategies_all]
+    if unknown:
+        raise ValueError(f"Unknown strategies: {unknown}. Valid: {strategies_all}")
+
+    if "fused_select" in strategies and ext is None and rank == 0:
+        print("WARNING: strategy=fused_select requested but router_ext_cuda is not available; will fall back to naive_topk selection.")
+
+    def route_select(logits: torch.Tensor, strategy: str) -> tuple[torch.Tensor, torch.Tensor, float]:
         # Returns topk_idx [S,K] int64, topk_w [S,K] dtype, and t_select_us
         topk_idx: torch.Tensor
         topk_w: torch.Tensor
 
         def do():
             nonlocal topk_idx, topk_w
-            if args.strategy == "sinkhorn":
+            if strategy == "sinkhorn":
                 topk_idx, topk_w = sinkhorn_router(logits, k)
                 return
-            if args.strategy == "fused_select" and ext is not None and k <= 8:
+            if strategy == "fused_select" and ext is not None and k <= 8:
                 idx_i32, w_f32 = ext.forward(logits, int(k))
                 topk_idx = idx_i32.to(torch.int64)
                 topk_w = w_f32.to(dtype=logits.dtype)
@@ -190,14 +217,14 @@ def main() -> None:
         t_ms = _cuda_ms(do)
         return topk_idx, topk_w, t_ms * 1000.0
 
-    def one_iter(overlap: bool) -> EPResult:
+    def one_iter(overlap: bool, strategy: str) -> EPResult:
         # 1) logits
         logits = x @ w_router.t()
         if args.skew_experts > 0 and args.skew_bias != 0.0:
             logits[:, : args.skew_experts] += args.skew_bias
 
         # 2) selection timing
-        topk_idx, topk_w, t_select_us = route_select(logits)
+        topk_idx, topk_w, t_select_us = route_select(logits, strategy)
 
         # 3) compute load skew from routes (global experts)
         expert_ids = topk_idx.reshape(-1)
@@ -322,48 +349,73 @@ def main() -> None:
         )
 
     # Warmup
-    for _ in range(args.warmup):
-        _ = one_iter(overlap=False)
-        _ = one_iter(overlap=True)
-
-    # Collect results (rank0 prints)
-    res_seq = [one_iter(overlap=False) for _ in range(args.iters)]
-    res_ovl = [one_iter(overlap=True) for _ in range(args.iters)]
-
-    def mean(vals):
-        return sum(vals) / max(len(vals), 1)
+    def run_strategy(strategy: str) -> tuple[list[EPResult], list[EPResult]]:
+        for _ in range(args.warmup):
+            _ = one_iter(overlap=False, strategy=strategy)
+            _ = one_iter(overlap=True, strategy=strategy)
+        res_seq = [one_iter(overlap=False, strategy=strategy) for _ in range(args.iters)]
+        res_ovl = [one_iter(overlap=True, strategy=strategy) for _ in range(args.iters)]
+        return res_seq, res_ovl
 
     def avg_field(rs, name: str) -> float:
-        return mean([getattr(r, name) for r in rs])
+        return sum(getattr(r, name) for r in rs) / max(len(rs), 1)
 
-    # Baseline Top-k for ΔT_select
-    if args.strategy != "naive_topk":
-        args_baseline = argparse.Namespace(**vars(args))
-        args_baseline.strategy = "naive_topk"
-        # quick baseline selection timing (reuse current x/w)
-        # compute logits once
+    # Always compute baseline selection time (naive_topk) so ΔT_select makes sense
+    # even if user doesn't include naive_topk in the strategy list.
+    def baseline_select_us() -> float:
+        # Use a fixed logits tensor to isolate selection overhead.
         logits = x @ w_router.t()
         if args.skew_experts > 0 and args.skew_bias != 0.0:
             logits[:, : args.skew_experts] += args.skew_bias
-        _, _, t_base = route_select(logits)
-    else:
-        t_base = avg_field(res_seq, "t_select_us")
+        # Warmup
+        for _ in range(args.warmup):
+            _ = route_select(logits, "naive_topk")
+        ts = [route_select(logits, "naive_topk")[2] for _ in range(args.iters)]
+        return sum(ts) / max(len(ts), 1)
 
-    t_sel = avg_field(res_seq, "t_select_us")
-    delta_t_select = t_sel - t_base
+    t_base_select = baseline_select_us()
+
+    results: dict[str, tuple[list[EPResult], list[EPResult]]] = {}
+    for s in strategies:
+        # Keep ranks in lockstep to avoid NCCL oddities and make logs readable.
+        dist.barrier()
+        results[s] = run_strategy(s)
+    dist.barrier()
 
     if rank == 0:
         print("=== 2-GPU EP (PCIe) Benchmark ===")
-        print("strategy:", args.strategy)
+        if len(strategies) == 1:
+            print("strategy:", strategies[0])
+        else:
+            print("strategies:", strategies)
         print("dtype:", args.dtype, "T(tokens/rank):", args.tokens, "d_model:", args.d_model, "E:", args.experts, "k:", args.top_k)
         print("skew_experts:", args.skew_experts, "skew_bias:", args.skew_bias)
-        print("T_select_us(mean):", t_sel, "ΔT_select_us:", delta_t_select)
-        print("T_comm_us(mean):", avg_field(res_seq, "t_comm_us"))
-        print("load_max_over_mean(mean):", avg_field(res_seq, "load_max_over_mean"))
-        print("load_cv(mean):", avg_field(res_seq, "load_cv"))
-        print("T_total_us(mean, sequential):", avg_field(res_seq, "t_total_us"))
-        print("T_total_us(mean, overlapped):", avg_field(res_ovl, "t_total_overlap_us"))
-        print("eta_overlap(mean):", avg_field(res_ovl, "eta_overlap"))
+        print("T_select_us(baseline naive_topk):", t_base_select)
+
+        if len(strategies) == 1:
+            s = strategies[0]
+            res_seq, res_ovl = results[s]
+            t_sel = avg_field(res_seq, "t_select_us")
+            delta_t_select = t_sel - t_base_select
+            print("T_select_us(mean):", t_sel, "ΔT_select_us:", delta_t_select)
+            print("T_comm_us(mean):", avg_field(res_seq, "t_comm_us"))
+            print("load_max_over_mean(mean):", avg_field(res_seq, "load_max_over_mean"))
+            print("load_cv(mean):", avg_field(res_seq, "load_cv"))
+            print("T_total_us(mean, sequential):", avg_field(res_seq, "t_total_us"))
+            print("T_total_us(mean, overlapped):", avg_field(res_ovl, "t_total_overlap_us"))
+            print("eta_overlap(mean):", avg_field(res_ovl, "eta_overlap"))
+        else:
+            print("")
+            print("=== E2E MoE Layer Latency (us, mean) ===")
+            print(
+                f"{'strategy':<12} {'T_select':>10} {'ΔT_select':>10} {'T_comm':>10} {'T_total(seq)':>14} {'T_total(ovl)':>14} {'eta':>8}"
+            )
+            for s in strategies:
+                res_seq, res_ovl = results[s]
+                t_sel = avg_field(res_seq, "t_select_us")
+                print(
+                    f"{s:<12} {t_sel:10.1f} {(t_sel - t_base_select):10.1f} {avg_field(res_seq, 't_comm_us'):10.1f} {avg_field(res_seq, 't_total_us'):14.1f} {avg_field(res_ovl, 't_total_overlap_us'):14.1f} {avg_field(res_ovl, 'eta_overlap'):8.3f}"
+                )
 
 if __name__ == "__main__":
     # Make NCCL a bit more verbose if desired

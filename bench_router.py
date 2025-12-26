@@ -83,6 +83,18 @@ def main() -> None:
     p.add_argument("--experts", type=int, default=64, help="E")
     p.add_argument("--top_k", type=int, default=2, help="k")
     p.add_argument(
+        "--strategies",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Run multiple strategies and print a comparison table (overrides --strategy).",
+    )
+    p.add_argument(
+        "--all_strategies",
+        action="store_true",
+        help="Run all strategies: naive_topk, masked_matmul (A), fused_select (B), sinkhorn (C).",
+    )
+    p.add_argument(
         "--strategy",
         type=str,
         default="naive_topk",
@@ -113,7 +125,22 @@ def main() -> None:
     torch_router = TorchTopKRouter()
     sinkhorn_router = SinkhornRouter(iters=args.sinkhorn_iters, temperature=args.sinkhorn_temperature)
 
-    def one_iter() -> Timing:
+    strategies_all = ["naive_topk", "masked_matmul", "fused_select", "sinkhorn"]
+    if args.all_strategies:
+        strategies = strategies_all
+    elif args.strategies is not None:
+        strategies = args.strategies
+    else:
+        strategies = [args.strategy]
+
+    unknown = [s for s in strategies if s not in strategies_all]
+    if unknown:
+        raise ValueError(f"Unknown strategies: {unknown}. Valid: {strategies_all}")
+
+    if "fused_select" in strategies and ext is None and device.type == "cuda":
+        print("WARNING: strategy=fused_select requested but router_ext_cuda is not available; will fall back to naive_topk.")
+
+    def one_iter(strategy: str) -> Timing:
         if device.type != "cuda":
             # CPU fallback timing (rough)
             t0 = time.perf_counter()
@@ -121,14 +148,14 @@ def main() -> None:
             t1 = time.perf_counter()
             if args.skew_experts > 0 and args.skew_bias != 0.0:
                 logits[:, : args.skew_experts] += args.skew_bias
-            if args.strategy == "masked_matmul":
+            if strategy == "masked_matmul":
                 probs = torch.softmax(logits, dim=-1)
                 # simulate compute cost only (no selection/pack)
                 _ = probs.sum()
                 t2 = time.perf_counter()
                 return Timing((t1 - t0) * 1e3, (t2 - t1) * 1e3, 0.0, (t2 - t0) * 1e3)
 
-            if args.strategy == "sinkhorn":
+            if strategy == "sinkhorn":
                 topk_idx, topk_w = sinkhorn_router(logits, args.top_k)
             else:
                 topk_idx, topk_w = torch_router(logits, args.top_k)
@@ -152,7 +179,7 @@ def main() -> None:
 
         def do_select():
             nonlocal topk_idx, topk_w
-            if args.strategy == "masked_matmul":
+            if strategy == "masked_matmul":
                 # Strategy A: avoid permutation by computing a dense mask/probabilities.
                 # Here we just compute probabilities; "compute redundancy" happens in expert compute.
                 _ = torch.softmax(logits.float(), dim=-1)
@@ -160,11 +187,11 @@ def main() -> None:
                 topk_w = torch.empty((args.tokens, args.top_k), device=device, dtype=dtype)
                 return
 
-            if args.strategy == "sinkhorn":
+            if strategy == "sinkhorn":
                 topk_idx, topk_w = sinkhorn_router(logits, args.top_k)
                 return
 
-            if args.strategy == "fused_select" and ext is not None and logits.is_cuda and args.top_k <= 8:
+            if strategy == "fused_select" and ext is not None and logits.is_cuda and args.top_k <= 8:
                 idx_i32, w_f32 = ext.forward(logits, int(args.top_k))
                 topk_idx = idx_i32.to(torch.int64)
                 topk_w = w_f32.to(dtype=logits.dtype)
@@ -177,38 +204,58 @@ def main() -> None:
         t_select = _cuda_time(do_select)
 
         def do_pack():
-            if args.strategy == "masked_matmul":
+            if strategy == "masked_matmul":
                 return
             _pack_routes(x, topk_idx, topk_w)
 
         t_pack = _cuda_time(do_pack)
         return Timing(t_logit, t_select, t_pack, t_logit + t_select + t_pack)
 
-    # Warmup
-    for _ in range(args.warmup):
-        _ = one_iter()
+    def run_strategy(strategy: str) -> Timing:
+        # Warmup
+        for _ in range(args.warmup):
+            _ = one_iter(strategy)
+        timings = [one_iter(strategy) for _ in range(args.iters)]
 
-    timings = [one_iter() for _ in range(args.iters)]
+        def avg(getter) -> float:
+            return sum(getter(t) for t in timings) / max(len(timings), 1)
 
-    def avg(getter) -> float:
-        return sum(getter(t) for t in timings) / max(len(timings), 1)
+        return Timing(
+            t_logit_ms=avg(lambda t: t.t_logit_ms),
+            t_select_ms=avg(lambda t: t.t_select_ms),
+            t_pack_ms=avg(lambda t: t.t_pack_ms),
+            t_route_ms=avg(lambda t: t.t_route_ms),
+        )
 
-    mean = Timing(
-        t_logit_ms=avg(lambda t: t.t_logit_ms),
-        t_select_ms=avg(lambda t: t.t_select_ms),
-        t_pack_ms=avg(lambda t: t.t_pack_ms),
-        t_route_ms=avg(lambda t: t.t_route_ms),
-    )
+    results: dict[str, Timing] = {}
+    for s in strategies:
+        results[s] = run_strategy(s)
 
-    print("strategy:", args.strategy)
+    # Metadata header
+    if len(strategies) == 1:
+        print("strategy:", strategies[0])
+    else:
+        print("strategies:", strategies)
     print("device:", device)
     print("dtype:", dtype)
     print("T(tokens):", args.tokens, "d_model:", args.d_model, "E:", args.experts, "k:", args.top_k)
     print("skew_experts:", args.skew_experts, "skew_bias:", args.skew_bias)
-    print("T_logit_ms:", mean.t_logit_ms)
-    print("T_select_ms:", mean.t_select_ms)
-    print("T_pack_ms:", mean.t_pack_ms)
-    print("T_route_ms:", mean.t_route_ms)
+
+    if len(strategies) == 1:
+        mean = results[strategies[0]]
+        print("T_logit_ms:", mean.t_logit_ms)
+        print("T_select_ms:", mean.t_select_ms)
+        print("T_pack_ms:", mean.t_pack_ms)
+        print("T_route_ms:", mean.t_route_ms)
+        return
+
+    # Table for multi-strategy
+    print("")
+    print("=== Router Latency Breakdown (ms, mean) ===")
+    print(f"{'strategy':<14} {'T_logit':>10} {'T_select':>10} {'T_pack':>10} {'T_route':>10}")
+    for s in strategies:
+        t = results[s]
+        print(f"{s:<14} {t.t_logit_ms:10.3f} {t.t_select_ms:10.3f} {t.t_pack_ms:10.3f} {t.t_route_ms:10.3f}")
 
 
 if __name__ == "__main__":

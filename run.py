@@ -28,135 +28,8 @@ from models.decoder_moe import DecoderMoEConfig, DecoderMoEModel
 from models.transformer_decoder_model import TransformerDecoderConfig, TransformerDecoderModel
 
 
-def _export_onnx_with_external_data(
-    model: torch.nn.Module,
-    example_input: torch.Tensor,
-    out_dir: Path,
-    *,
-    input_names: list[str],
-    output_names: list[str],
-    dynamic_axes: dict[str, dict[int, str]],
-) -> None:
-    """Export an ONNX model split into graph (__model__) + external weights (__params__)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    model_path = out_dir / "__model__"
-    params_name = "__params__"
-
-    # 1) Export ONNX to a temp file first.
-    tmp_model_path = out_dir / "_tmp_model.onnx"
-
-    torch.onnx.export(
-        model,
-        example_input,
-        tmp_model_path.as_posix(),
-        export_params=True,
-        opset_version=17,
-        do_constant_folding=True,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes,
-        # Be conservative for maximum compatibility with python-side constructs.
-        dynamo=False,
-    )
-
-    # 2) Re-save with external data so we can split graph vs weights.
-    try:
-        import onnx  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Missing dependency 'onnx'. Install it via: pip install onnx"
-        ) from e
-
-    m = onnx.load(tmp_model_path.as_posix())
-    onnx.save_model(
-        m,
-        model_path.as_posix(),
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=params_name,
-    )
-
-    # Cleanup temp file (leave __model__ / __params__)
-    try:
-        tmp_model_path.unlink()
-    except OSError:
-        pass
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="one_layer",
-        choices=["one_layer", "transformer_decoder", "decoder_moe"],
-        help="Which model to run.",
-    )
-    parser.add_argument("--batch", type=int, default=8)
-    # One-layer demo params
-    parser.add_argument("--hidden", type=int, default=4096, help="(one_layer) hidden size")
-    parser.add_argument("--dtype", type=str, default="fp16")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=20)
-    # Transformer-decoder params
-    parser.add_argument("--seq_len", type=int, default=128, help="(transformer_decoder) sequence length")
-    parser.add_argument("--vocab_size", type=int, default=32000, help="(transformer_decoder) vocabulary size")
-    parser.add_argument("--d_model", type=int, default=512, help="(transformer_decoder) model width")
-    parser.add_argument("--n_heads", type=int, default=8, help="(transformer_decoder) number of heads")
-    parser.add_argument("--n_layers", type=int, default=6, help="(transformer_decoder) number of layers")
-    parser.add_argument("--mlp_hidden_dim", type=int, default=2048, help="(transformer_decoder) MLP hidden dim")
-    parser.add_argument("--moe_n_experts", type=int, default=8, help="(decoder_moe) number of experts")
-    parser.add_argument("--moe_top_k", type=int, default=2, help="(decoder_moe) top-k routing")
-    parser.add_argument(
-        "--moe_router",
-        type=str,
-        default="torch",
-        choices=["torch", "cuda_ext", "sinkhorn"],
-        help="(decoder_moe) router backend: torch, CUDA extension (router_ext_cuda), or sinkhorn (balanced routing).",
-    )
-    parser.add_argument("--sinkhorn_iters", type=int, default=10, help="(decoder_moe, sinkhorn) Sinkhorn iterations")
-    parser.add_argument(
-        "--sinkhorn_epsilon", type=float, default=1e-6, help="(decoder_moe, sinkhorn) numerical epsilon"
-    )
-    parser.add_argument(
-        "--sinkhorn_temperature", type=float, default=1.0, help="(decoder_moe, sinkhorn) router temperature"
-    )
-    parser.add_argument(
-        "--moe_metrics",
-        action="store_true",
-        help="(decoder_moe) collect and print MoE routing metrics (overhead/sparsity/utilization/load balance).",
-    )
-    parser.add_argument(
-        "--max_seq_len",
-        type=int,
-        default=2048,
-        help="(transformer_decoder) maximum sequence length (used for absolute pos embedding cache size)",
-    )
-    parser.add_argument(
-        "--absolute_pos_embedding",
-        action="store_true",
-        help="(transformer_decoder) use absolute positional embedding instead of RoPE",
-    )
-    parser.add_argument(
-        "--export_onnx_dir",
-        type=str,
-        default=None,
-        help=(
-            "If set, export a Netron-friendly ONNX pair to this directory: "
-            "__model__ (graph) + __params__ (external weights). Export is done on CPU/fp32."
-        ),
-    )
-    args = parser.parse_args()
-
-    torch.manual_seed(args.seed)
-
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        device = torch.device("cpu")
-
-    dtype = _parse_dtype(args.dtype)
+def _run_one(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> None:
+    # Model construction
     if args.model == "one_layer":
         example = torch.randn(args.batch, args.hidden, device=device, dtype=dtype)
         model: torch.nn.Module = OneLayerModel(args.hidden).to(device=device, dtype=dtype).eval()
@@ -284,6 +157,7 @@ def main() -> None:
             print("  moe_output_std:", m.output.output_std)
             print("  moe_output_absmax:", m.output.output_absmax)
 
+    # Export (single-run only; compare mode disables this by setting export_onnx_dir=None)
     if args.export_onnx_dir:
         # Export on CPU for maximum compatibility.
         # Note: some PyTorch CPU kernels may not support fp16/bf16; for ONNX export
@@ -369,6 +243,171 @@ def main() -> None:
         print("  __model__  :", (export_dir / "__model__").as_posix())
         print("  __params__ :", (export_dir / "__params__").as_posix())
         print("Open '__model__' in Netron.")
+
+
+def _export_onnx_with_external_data(
+    model: torch.nn.Module,
+    example_input: torch.Tensor,
+    out_dir: Path,
+    *,
+    input_names: list[str],
+    output_names: list[str],
+    dynamic_axes: dict[str, dict[int, str]],
+) -> None:
+    """Export an ONNX model split into graph (__model__) + external weights (__params__)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_dir / "__model__"
+    params_name = "__params__"
+
+    # 1) Export ONNX to a temp file first.
+    tmp_model_path = out_dir / "_tmp_model.onnx"
+
+    torch.onnx.export(
+        model,
+        example_input,
+        tmp_model_path.as_posix(),
+        export_params=True,
+        opset_version=17,
+        do_constant_folding=True,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        # Be conservative for maximum compatibility with python-side constructs.
+        dynamo=False,
+    )
+
+    # 2) Re-save with external data so we can split graph vs weights.
+    try:
+        import onnx  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            "Missing dependency 'onnx'. Install it via: pip install onnx"
+        ) from e
+
+    m = onnx.load(tmp_model_path.as_posix())
+    onnx.save_model(
+        m,
+        model_path.as_posix(),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=params_name,
+    )
+
+    # Cleanup temp file (leave __model__ / __params__)
+    try:
+        tmp_model_path.unlink()
+    except OSError:
+        pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="one_layer",
+        choices=["one_layer", "transformer_decoder", "decoder_moe"],
+        help="Which model to run.",
+    )
+    parser.add_argument("--batch", type=int, default=8)
+    # One-layer demo params
+    parser.add_argument("--hidden", type=int, default=4096, help="(one_layer) hidden size")
+    parser.add_argument("--dtype", type=str, default="fp16")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=20)
+    # Transformer-decoder params
+    parser.add_argument("--seq_len", type=int, default=128, help="(transformer_decoder) sequence length")
+    parser.add_argument("--vocab_size", type=int, default=32000, help="(transformer_decoder) vocabulary size")
+    parser.add_argument("--d_model", type=int, default=512, help="(transformer_decoder) model width")
+    parser.add_argument("--n_heads", type=int, default=8, help="(transformer_decoder) number of heads")
+    parser.add_argument("--n_layers", type=int, default=6, help="(transformer_decoder) number of layers")
+    parser.add_argument("--mlp_hidden_dim", type=int, default=2048, help="(transformer_decoder) MLP hidden dim")
+    parser.add_argument("--moe_n_experts", type=int, default=8, help="(decoder_moe) number of experts")
+    parser.add_argument("--moe_top_k", type=int, default=2, help="(decoder_moe) top-k routing")
+    parser.add_argument(
+        "--moe_router",
+        type=str,
+        default="torch",
+        choices=["torch", "cuda_ext", "sinkhorn"],
+        help="(decoder_moe) router backend: torch, CUDA extension (router_ext_cuda), or sinkhorn (balanced routing).",
+    )
+    parser.add_argument(
+        "--compare_moe_routers",
+        action="store_true",
+        help="(decoder_moe) run and print metrics for all router backends: torch, cuda_ext, sinkhorn.",
+    )
+    parser.add_argument("--sinkhorn_iters", type=int, default=10, help="(decoder_moe, sinkhorn) Sinkhorn iterations")
+    parser.add_argument(
+        "--sinkhorn_epsilon", type=float, default=1e-6, help="(decoder_moe, sinkhorn) numerical epsilon"
+    )
+    parser.add_argument(
+        "--sinkhorn_temperature", type=float, default=1.0, help="(decoder_moe, sinkhorn) router temperature"
+    )
+    parser.add_argument(
+        "--moe_metrics",
+        action="store_true",
+        help="(decoder_moe) collect and print MoE routing metrics (overhead/sparsity/utilization/load balance).",
+    )
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=2048,
+        help="(transformer_decoder) maximum sequence length (used for absolute pos embedding cache size)",
+    )
+    parser.add_argument(
+        "--absolute_pos_embedding",
+        action="store_true",
+        help="(transformer_decoder) use absolute positional embedding instead of RoPE",
+    )
+    parser.add_argument(
+        "--export_onnx_dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, export a Netron-friendly ONNX pair to this directory: "
+            "__model__ (graph) + __params__ (external weights). Export is done on CPU/fp32."
+        ),
+    )
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        device = torch.device("cpu")
+
+    dtype = _parse_dtype(args.dtype)
+
+    # Convenience: compare all MoE router backends in one command.
+    if args.model == "decoder_moe" and args.compare_moe_routers:
+        if not args.moe_metrics:
+            print("NOTE: enabling --moe_metrics because --compare_moe_routers was set.")
+            args.moe_metrics = True
+
+        # Best-effort availability hint for cuda_ext
+        if args.device == "cuda":
+            try:
+                import router_ext_cuda  # type: ignore  # noqa: F401
+                cuda_ext_available = True
+            except Exception:
+                cuda_ext_available = False
+            if not cuda_ext_available:
+                print("WARNING: router_ext_cuda not available; 'cuda_ext' will fall back to torch inside the model.")
+
+        routers = ["torch", "cuda_ext", "sinkhorn"]
+        print("=== Compare MoE Routers (E2E + breakdown) ===")
+        for rb in routers:
+            print("")
+            print("--- moe_router:", rb, "---")
+            args_one = argparse.Namespace(**vars(args))
+            args_one.moe_router = rb
+            args_one.export_onnx_dir = None
+            _run_one(args_one, device, dtype)
+        return
+
+    _run_one(args, device, dtype)
 
 
 if __name__ == "__main__":
