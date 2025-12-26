@@ -1,0 +1,335 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+2-GPU PCIe Expert-Parallel (EP) benchmark for routing strategies.
+
+Run with:
+  torchrun --nproc_per_node 2 bench_2gpu_pcie.py ...
+
+Measures (forward-only):
+  - T_select and ΔT_select vs Top-k baseline
+  - T_comm via all_to_all_single (tokens exchanged to expert owners)
+  - Load skew: max(V)/mean(V), CV over expert token counts
+  - End-to-end layer latency:
+      T_total          : sequential (route -> comm -> comp -> comm_back)
+      T_total_overlap  : overlap local-expert compute with comm (best-effort)
+      eta_overlap      : (T_route + T_comm + T_comp) / T_total_overlap
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.distributed as dist
+
+from models.decoder_moe import SinkhornRouter, TorchTopKRouter
+
+
+def _maybe_import_router_ext():
+    try:
+        import router_ext_cuda  # type: ignore
+
+        return router_ext_cuda
+    except Exception:
+        return None
+
+
+def _setup_dist() -> tuple[int, int, torch.device]:
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    torch.cuda.set_device(rank)
+    return rank, world, torch.device("cuda", rank)
+
+
+def _cuda_ms(fn) -> float:
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    fn()
+    e.record()
+    torch.cuda.synchronize()
+    return float(s.elapsed_time(e))
+
+
+@dataclass
+class EPResult:
+    t_select_us: float
+    t_comm_us: float
+    t_comp_us: float
+    t_total_us: float
+    t_total_overlap_us: float
+    eta_overlap: float
+    load_max_over_mean: float
+    load_cv: float
+
+
+def _expert_mlp(x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    # SwiGLU: silu(x@w1^T) * (x@w3^T) -> @w2^T
+    a = torch.nn.functional.silu(x @ w1.t())
+    b = x @ w3.t()
+    return (a * b) @ w2.t()
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"])
+    p.add_argument("--tokens", type=int, default=4096, help="T (tokens per rank)")
+    p.add_argument("--d_model", type=int, default=4096)
+    p.add_argument("--experts", type=int, default=64, help="E (global experts)")
+    p.add_argument("--top_k", type=int, default=2)
+    p.add_argument(
+        "--strategy",
+        type=str,
+        default="naive_topk",
+        choices=["naive_topk", "fused_select", "sinkhorn"],
+    )
+    p.add_argument("--sinkhorn_iters", type=int, default=10)
+    p.add_argument("--sinkhorn_temperature", type=float, default=1.0)
+    p.add_argument("--warmup", type=int, default=5)
+    p.add_argument("--iters", type=int, default=20)
+    # Synthetic skew (bias the first N experts)
+    p.add_argument("--skew_experts", type=int, default=0)
+    p.add_argument("--skew_bias", type=float, default=0.0)
+    args = p.parse_args()
+
+    rank, world, device = _setup_dist()
+    if world != 2:
+        raise RuntimeError("This benchmark is designed for world_size=2")
+
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
+    dtype = dtype_map[args.dtype]
+    torch.manual_seed(0)
+
+    E = args.experts
+    if E % world != 0:
+        raise ValueError("experts must be divisible by world_size")
+    E_local = E // world
+    k = args.top_k
+
+    # Local tokens on each rank.
+    x = torch.randn(args.tokens, args.d_model, device=device, dtype=dtype)
+
+    # Router weight (shared across ranks for fairness): [E, d]
+    w_router = torch.randn(E, args.d_model, device=device, dtype=dtype)
+
+    # Local experts' MLP weights: [E_local, hidden, d] simplified as per-expert matrices.
+    hidden = args.d_model  # keep simple
+    w1 = torch.randn(E_local, hidden, args.d_model, device=device, dtype=dtype)
+    w3 = torch.randn(E_local, hidden, args.d_model, device=device, dtype=dtype)
+    w2 = torch.randn(E_local, args.d_model, hidden, device=device, dtype=dtype)
+
+    ext = _maybe_import_router_ext()
+    torch_router = TorchTopKRouter()
+    sinkhorn_router = SinkhornRouter(iters=args.sinkhorn_iters, temperature=args.sinkhorn_temperature)
+
+    def route_select(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
+        # Returns topk_idx [S,K] int64, topk_w [S,K] dtype, and t_select_us
+        topk_idx: torch.Tensor
+        topk_w: torch.Tensor
+
+        def do():
+            nonlocal topk_idx, topk_w
+            if args.strategy == "sinkhorn":
+                topk_idx, topk_w = sinkhorn_router(logits, k)
+                return
+            if args.strategy == "fused_select" and ext is not None and k <= 8:
+                idx_i32, w_f32 = ext.forward(logits, int(k))
+                topk_idx = idx_i32.to(torch.int64)
+                topk_w = w_f32.to(dtype=logits.dtype)
+                return
+            # naive_topk
+            vals, idx = torch.topk(logits, k=k, dim=-1)
+            topk_idx = idx.to(torch.int64)
+            topk_w = torch.softmax(vals, dim=-1)
+
+        t_ms = _cuda_ms(do)
+        return topk_idx, topk_w, t_ms * 1000.0
+
+    def one_iter(overlap: bool) -> EPResult:
+        # 1) logits
+        logits = x @ w_router.t()
+        if args.skew_experts > 0 and args.skew_bias != 0.0:
+            logits[:, : args.skew_experts] += args.skew_bias
+
+        # 2) selection timing
+        topk_idx, topk_w, t_select_us = route_select(logits)
+
+        # 3) compute load skew from routes (global experts)
+        expert_ids = topk_idx.reshape(-1)
+        counts = torch.bincount(expert_ids, minlength=E).to(torch.float32)  # per-expert routes (local tokens only)
+        # Aggregate across ranks
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        mean = float(counts.mean().item())
+        std = float(counts.std(unbiased=False).item())
+        load_cv = float(std / (mean + 1e-9))
+        load_max_over_mean = float((counts.max().item() / (mean + 1e-9)))
+
+        # 4) pack tokens by destination rank
+        S = x.size(0)
+        token_ids = torch.arange(S, device=device, dtype=torch.int64).unsqueeze(1).expand(S, k).reshape(-1)
+        expert_ids = topk_idx.reshape(-1).to(torch.int64)
+        weights = topk_w.reshape(-1).unsqueeze(-1)
+        x_route = x.index_select(0, token_ids) * weights  # [R, d]
+
+        dest_rank = (expert_ids // E_local).to(torch.int64)  # [R]
+        # Sort by dest_rank so we can slice contiguous send buffers
+        sort_idx = torch.argsort(dest_rank)
+        dest_rank = dest_rank.index_select(0, sort_idx)
+        expert_ids = expert_ids.index_select(0, sort_idx)
+        x_route = x_route.index_select(0, sort_idx)
+
+        # Split into send buffers for each rank
+        send_counts = torch.bincount(dest_rank, minlength=world).to(torch.int64)  # [2]
+        send_splits = send_counts.tolist()
+        # all_to_all requires recv splits too; exchange counts first
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts)
+        recv_splits = recv_counts.tolist()
+
+        # Build contiguous send tensor
+        send = x_route
+        recv = torch.empty((int(recv_counts.sum().item()), args.d_model), device=device, dtype=dtype)
+
+        # 5) Comm + compute
+        # Local part: slice routes that stay on this rank
+        local_mask = dest_rank == rank
+        local_x = send[local_mask]
+        local_e = expert_ids[local_mask] - rank * E_local  # local expert id in [0, E_local)
+
+        # Remote part: send everything; receiver will compute on received tokens.
+        # For simplicity we compute only after receive. Overlap mode computes local while comm in flight.
+        comm_stream = torch.cuda.Stream()
+        compute_stream = torch.cuda.Stream()
+
+        t_comm_us = 0.0
+        t_comp_us = 0.0
+
+        def do_comm():
+            dist.all_to_all_single(recv, send, recv_splits=recv_splits, send_splits=send_splits)
+
+        def do_local_comp():
+            # Group by local expert (bucket) and run per-expert batched GEMM
+            if local_x.numel() == 0:
+                return
+            # sort by expert
+            sidx = torch.argsort(local_e)
+            lx = local_x.index_select(0, sidx)
+            le = local_e.index_select(0, sidx)
+            counts_e = torch.bincount(le, minlength=E_local)
+            start = 0
+            out_local = torch.empty_like(lx)
+            for e in range(E_local):
+                c = int(counts_e[e].item())
+                if c == 0:
+                    continue
+                end = start + c
+                out_local[start:end] = _expert_mlp(lx[start:end], w1[e], w3[e], w2[e])
+                start = end
+            _ = out_local  # placeholder (not used further)
+
+        # Timing total sequential vs overlap
+        def sequential_total() -> tuple[float, float, float, float]:
+            # comm
+            t_comm = _cuda_ms(do_comm) * 1000.0
+            # compute on recv (treat all received routes as local now, but we don't track original expert ids here)
+            # NOTE: for benchmark purposes we approximate compute by running local comp on local_x only,
+            # and treat recv compute as similar cost. This keeps the harness simple but still stresses comm.
+            t_comp = _cuda_ms(do_local_comp) * 1000.0
+            t_total = t_select_us + t_comm + t_comp
+            return t_comm, t_comp, t_total, t_total
+
+        def overlapped_total() -> tuple[float, float, float, float]:
+            # Launch comm on comm stream, local compute on compute stream.
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            with torch.cuda.stream(comm_stream):
+                do_comm()
+            with torch.cuda.stream(compute_stream):
+                do_local_comp()
+            # Wait both
+            torch.cuda.current_stream().wait_stream(comm_stream)
+            torch.cuda.current_stream().wait_stream(compute_stream)
+            end.record()
+            torch.cuda.synchronize()
+            t_overlap = float(start.elapsed_time(end)) * 1000.0
+            # Separately measure comm/comp for reporting
+            t_comm = _cuda_ms(do_comm) * 1000.0
+            t_comp = _cuda_ms(do_local_comp) * 1000.0
+            t_total = t_select_us + t_comm + t_comp
+            return t_comm, t_comp, t_total, t_overlap + t_select_us
+
+        if overlap:
+            t_comm_us, t_comp_us, t_total_us, t_total_overlap_us = overlapped_total()
+        else:
+            t_comm_us, t_comp_us, t_total_us, t_total_overlap_us = sequential_total()
+
+        eta = float((t_select_us + t_comm_us + t_comp_us) / max(t_total_overlap_us, 1e-6))
+        return EPResult(
+            t_select_us=t_select_us,
+            t_comm_us=t_comm_us,
+            t_comp_us=t_comp_us,
+            t_total_us=t_total_us,
+            t_total_overlap_us=t_total_overlap_us,
+            eta_overlap=eta,
+            load_max_over_mean=load_max_over_mean,
+            load_cv=load_cv,
+        )
+
+    # Warmup
+    for _ in range(args.warmup):
+        _ = one_iter(overlap=False)
+        _ = one_iter(overlap=True)
+
+    # Collect results (rank0 prints)
+    res_seq = [one_iter(overlap=False) for _ in range(args.iters)]
+    res_ovl = [one_iter(overlap=True) for _ in range(args.iters)]
+
+    def mean(vals):
+        return sum(vals) / max(len(vals), 1)
+
+    def avg_field(rs, name: str) -> float:
+        return mean([getattr(r, name) for r in rs])
+
+    # Baseline Top-k for ΔT_select
+    if args.strategy != "naive_topk":
+        args_baseline = argparse.Namespace(**vars(args))
+        args_baseline.strategy = "naive_topk"
+        # quick baseline selection timing (reuse current x/w)
+        # compute logits once
+        logits = x @ w_router.t()
+        if args.skew_experts > 0 and args.skew_bias != 0.0:
+            logits[:, : args.skew_experts] += args.skew_bias
+        _, _, t_base = route_select(logits)
+    else:
+        t_base = avg_field(res_seq, "t_select_us")
+
+    t_sel = avg_field(res_seq, "t_select_us")
+    delta_t_select = t_sel - t_base
+
+    if rank == 0:
+        print("=== 2-GPU EP (PCIe) Benchmark ===")
+        print("strategy:", args.strategy)
+        print("dtype:", args.dtype, "T(tokens/rank):", args.tokens, "d_model:", args.d_model, "E:", args.experts, "k:", args.top_k)
+        print("skew_experts:", args.skew_experts, "skew_bias:", args.skew_bias)
+        print("T_select_us(mean):", t_sel, "ΔT_select_us:", delta_t_select)
+        print("T_comm_us(mean):", avg_field(res_seq, "t_comm_us"))
+        print("load_max_over_mean(mean):", avg_field(res_seq, "load_max_over_mean"))
+        print("load_cv(mean):", avg_field(res_seq, "load_cv"))
+        print("T_total_us(mean, sequential):", avg_field(res_seq, "t_total_us"))
+        print("T_total_us(mean, overlapped):", avg_field(res_ovl, "t_total_overlap_us"))
+        print("eta_overlap(mean):", avg_field(res_ovl, "eta_overlap"))
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    # Make NCCL a bit more verbose if desired
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    main()
+
+

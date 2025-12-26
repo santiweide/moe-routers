@@ -91,4 +91,84 @@ Open `__model__` in Netron.
 - If Triton is not installed (or you're on CPU), it automatically uses the Torch fallback implementation.
 - This demo is inference-only (no backward).
 
+## Overhead-Aware Routing Strategies (Experiment Harness)
+
+This repo includes two scripts that map to the experiment design:
+
+- `bench_router.py`: **single-process** router microbenchmark that reports a breakdown:
+  - `T_logit` (router matmul), `T_select` (selection), `T_pack` (pack/permutation), `T_route`
+  - Supports strategies:
+    - `naive_topk`
+    - `masked_matmul` (Strategy A, no permutation; only viable for small E)
+    - `fused_select` (partial Strategy B: uses `router_ext_cuda.forward()` for top-k+softmax; pack still in Torch)
+    - `sinkhorn` (Strategy C: algorithmic load balancing)
+
+- `bench_2gpu_pcie.py`: **2-GPU EP (PCIe) benchmark** run via `torchrun`, measuring:
+  - `ΔT_select` vs `naive_topk`
+  - `T_comm` via `all_to_all_single`
+  - load skew (`max(V)/mean(V)`, `CV`)
+  - end-to-end layer latency with and without overlap + `eta_overlap`
+
+### Single-GPU Router Breakdown (Table-style numbers)
+
+Baseline (Naive Top-k):
+
+```bash
+python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy naive_topk
+```
+
+Strategy A (Masked Matmul, no permutation):
+
+```bash
+python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 8 --top_k 2 --strategy masked_matmul
+```
+
+Strategy B (Fused selection, requires extension):
+
+```bash
+python setup_router_ext.py build_ext --inplace
+python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy fused_select
+```
+
+Strategy C (Sinkhorn routing):
+
+```bash
+python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy sinkhorn --sinkhorn_iters 10 --sinkhorn_temperature 1.0
+```
+
+Synthetic skew (bias first N experts to simulate load imbalance):
+
+```bash
+python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy naive_topk --skew_experts 8 --skew_bias 2.0
+```
+
+### 2-GPU PCIe EP Benchmark (Communication + Load Balance + Overlap)
+
+Run on a node with **2×A100 (PCIe)**:
+
+Naive Top-k baseline:
+
+```bash
+torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy naive_topk
+```
+
+Fused selection (partial Strategy B):
+
+```bash
+python setup_router_ext.py build_ext --inplace
+torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy fused_select
+```
+
+Sinkhorn (Strategy C):
+
+```bash
+torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy sinkhorn --sinkhorn_iters 10 --sinkhorn_temperature 1.0
+```
+
+With synthetic skew:
+
+```bash
+torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy naive_topk --skew_experts 8 --skew_bias 2.0
+```
+
 
