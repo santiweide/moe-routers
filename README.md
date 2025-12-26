@@ -62,6 +62,28 @@ python setup_router_ext.py build_ext --inplace
 python run.py --model decoder_moe --moe_router cuda_ext --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
 ```
 
+### Troubleshooting: GCC too old (PyTorch extensions require GCC/G++ 9+)
+
+If you see:
+`You're trying to build PyTorch with a too old version of GCC. We need GCC 9 or later.`
+
+You need to compile the extension with a newer host compiler. On clusters this usually means
+loading a newer GCC module and setting:
+
+```bash
+export CC=gcc-11
+export CXX=g++-11
+export CUDAHOSTCXX=g++-11
+python setup_router_ext.py build_ext --inplace
+```
+
+If your compilers are in a non-default path, you can also force NVCC's host compiler bindir:
+
+```bash
+export ROUTER_EXT_CCBIN=/path/to/gcc-11/bin
+python setup_router_ext.py build_ext --inplace
+```
+
 ## Export (Netron-friendly ONNX)
 
 Export as an ONNX pair:
