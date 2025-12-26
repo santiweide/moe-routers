@@ -71,16 +71,7 @@ You need to compile the extension with a newer host compiler. On clusters this u
 loading a newer GCC module and setting:
 
 ```bash
-export CC=gcc-11
-export CXX=g++-11
-export CUDAHOSTCXX=g++-11
-python setup_router_ext.py build_ext --inplace
-```
-
-If your compilers are in a non-default path, you can also force NVCC's host compiler bindir:
-
-```bash
-export ROUTER_EXT_CCBIN=/path/to/gcc-11/bin
+module load gcc/11.2.0
 python setup_router_ext.py build_ext --inplace
 ```
 
