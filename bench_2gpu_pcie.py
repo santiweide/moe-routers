@@ -45,6 +45,48 @@ def _setup_dist() -> tuple[int, int, torch.device]:
     return rank, world, torch.device("cuda", rank)
 
 
+def _all_to_all_single(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    *,
+    output_split_sizes: Optional[list[int]] = None,
+    input_split_sizes: Optional[list[int]] = None,
+):
+    """
+    Compatibility wrapper across PyTorch versions.
+
+    Some versions use `output_split_sizes`/`input_split_sizes`, others accept
+    `recv_splits`/`send_splits`. Prefer the canonical names and fall back.
+    """
+    if output_split_sizes is None and input_split_sizes is None:
+        return dist.all_to_all_single(output, input)
+
+    # Canonical keyword names (PyTorch)
+    try:
+        return dist.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
+    except TypeError:
+        pass
+
+    # Alternate keyword names used in some examples/older code
+    try:
+        return dist.all_to_all_single(
+            output,
+            input,
+            recv_splits=output_split_sizes,
+            send_splits=input_split_sizes,
+        )
+    except TypeError:
+        pass
+
+    # Positional fallback
+    return dist.all_to_all_single(output, input, output_split_sizes, input_split_sizes)
+
+
 def _cuda_ms(fn) -> float:
     s = torch.cuda.Event(enable_timing=True)
     e = torch.cuda.Event(enable_timing=True)
@@ -95,7 +137,6 @@ def main() -> None:
     p.add_argument("--skew_experts", type=int, default=0)
     p.add_argument("--skew_bias", type=float, default=0.0)
     args = p.parse_args()
-
     rank, world, device = _setup_dist()
     if world != 2:
         raise RuntimeError("This benchmark is designed for world_size=2")
@@ -187,7 +228,7 @@ def main() -> None:
         send_splits = send_counts.tolist()
         # all_to_all requires recv splits too; exchange counts first
         recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts, send_counts)
+        _all_to_all_single(recv_counts, send_counts)
         recv_splits = recv_counts.tolist()
 
         # Build contiguous send tensor
@@ -209,7 +250,7 @@ def main() -> None:
         t_comp_us = 0.0
 
         def do_comm():
-            dist.all_to_all_single(recv, send, recv_splits=recv_splits, send_splits=send_splits)
+            _all_to_all_single(recv, send, output_split_sizes=recv_splits, input_split_sizes=send_splits)
 
         def do_local_comp():
             # Group by local expert (bucket) and run per-expert batched GEMM
@@ -324,12 +365,16 @@ def main() -> None:
         print("T_total_us(mean, overlapped):", avg_field(res_ovl, "t_total_overlap_us"))
         print("eta_overlap(mean):", avg_field(res_ovl, "eta_overlap"))
 
-    dist.destroy_process_group()
-
-
 if __name__ == "__main__":
     # Make NCCL a bit more verbose if desired
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
-    main()
+    if "TORCH_NCCL_ASYNC_ERROR_HANDLING" not in os.environ:
+        os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1")
+    # Avoid deprecated env var warning on newer PyTorch.
+    os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+    try:
+        main()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
