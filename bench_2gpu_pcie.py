@@ -9,10 +9,10 @@ Measures (forward-only):
   - T_select and ΔT_select vs Top-k baseline
   - T_comm via all_to_all_single (tokens exchanged to expert owners)
   - Load skew: max(V)/mean(V), CV over expert token counts
-  - End-to-end layer latency:
-      T_total          : sequential (route -> comm -> comp -> comm_back)
-      T_total_overlap  : overlap local-expert compute with comm (best-effort)
-      eta_overlap      : (T_route + T_comm + T_comp) / T_total_overlap
+  - Dispatch-path latency (selection + A2A dispatch + local expert compute):
+      T_dispatch          : sequential
+      T_dispatch_overlap  : overlap local expert compute with A2A dispatch (best-effort)
+      eta_overlap         : (T_select + T_comm + T_comp) / T_dispatch_overlap
 """
 
 from __future__ import annotations
@@ -102,8 +102,8 @@ class EPResult:
     t_select_us: float
     t_comm_us: float
     t_comp_us: float
-    t_total_us: float
-    t_total_overlap_us: float
+    t_dispatch_us: float
+    t_dispatch_overlap_us: float
     eta_overlap: float
     load_max_over_mean: float
     load_cv: float
@@ -194,17 +194,18 @@ def main() -> None:
     if "fused_select" in strategies and ext is None and rank == 0:
         print("WARNING: strategy=fused_select requested but router_ext_cuda is not available; will fall back to naive_topk selection.")
 
-    def route_select(logits: torch.Tensor, strategy: str) -> tuple[torch.Tensor, torch.Tensor, float]:
+    def route_select(logits: torch.Tensor, strategy: Optional[str] = None) -> tuple[torch.Tensor, torch.Tensor, float]:
         # Returns topk_idx [S,K] int64, topk_w [S,K] dtype, and t_select_us
         topk_idx: torch.Tensor
         topk_w: torch.Tensor
+        st = strategy or args.strategy
 
         def do():
             nonlocal topk_idx, topk_w
-            if strategy == "sinkhorn":
+            if st == "sinkhorn":
                 topk_idx, topk_w = sinkhorn_router(logits, k)
                 return
-            if strategy == "fused_select" and ext is not None and k <= 8:
+            if st == "fused_select" and ext is not None and k <= 8:
                 idx_i32, w_f32 = ext.forward(logits, int(k))
                 topk_idx = idx_i32.to(torch.int64)
                 topk_w = w_f32.to(dtype=logits.dtype)
@@ -224,7 +225,7 @@ def main() -> None:
             logits[:, : args.skew_experts] += args.skew_bias
 
         # 2) selection timing
-        topk_idx, topk_w, t_select_us = route_select(logits, strategy)
+        topk_idx, topk_w, t_select_us = route_select(logits, strategy=strategy)
 
         # 3) compute load skew from routes (global experts)
         expert_ids = topk_idx.reshape(-1)
@@ -300,49 +301,69 @@ def main() -> None:
             _ = out_local  # placeholder (not used further)
 
         # Timing total sequential vs overlap
-        def sequential_total() -> tuple[float, float, float, float]:
+        def sequential_total() -> tuple[float, float, float]:
             # comm
             t_comm = _cuda_ms(do_comm) * 1000.0
             # compute on recv (treat all received routes as local now, but we don't track original expert ids here)
             # NOTE: for benchmark purposes we approximate compute by running local comp on local_x only,
             # and treat recv compute as similar cost. This keeps the harness simple but still stresses comm.
             t_comp = _cuda_ms(do_local_comp) * 1000.0
-            t_total = t_select_us + t_comm + t_comp
-            return t_comm, t_comp, t_total, t_total
+            t_dispatch = t_select_us + t_comm + t_comp
+            return t_comm, t_comp, t_dispatch
 
         def overlapped_total() -> tuple[float, float, float, float]:
-            # Launch comm on comm stream, local compute on compute stream.
+            # Launch comm on comm stream, local compute on compute stream (single execution).
+            cur = torch.cuda.current_stream()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-            start.record()
+
+            comm_start = torch.cuda.Event(enable_timing=True)
+            comm_end = torch.cuda.Event(enable_timing=True)
+            comp_start = torch.cuda.Event(enable_timing=True)
+            comp_end = torch.cuda.Event(enable_timing=True)
+
+            # Record a global start on current stream, then make both streams wait on it
+            start.record(cur)
+            comm_stream.wait_event(start)
+            compute_stream.wait_event(start)
+
             with torch.cuda.stream(comm_stream):
+                comm_start.record(comm_stream)
                 do_comm()
+                comm_end.record(comm_stream)
+
             with torch.cuda.stream(compute_stream):
+                comp_start.record(compute_stream)
                 do_local_comp()
-            # Wait both
-            torch.cuda.current_stream().wait_stream(comm_stream)
-            torch.cuda.current_stream().wait_stream(compute_stream)
-            end.record()
+                comp_end.record(compute_stream)
+
+            # Join streams and record end
+            cur.wait_stream(comm_stream)
+            cur.wait_stream(compute_stream)
+            end.record(cur)
             torch.cuda.synchronize()
-            t_overlap = float(start.elapsed_time(end)) * 1000.0
-            # Separately measure comm/comp for reporting
-            t_comm = _cuda_ms(do_comm) * 1000.0
-            t_comp = _cuda_ms(do_local_comp) * 1000.0
-            t_total = t_select_us + t_comm + t_comp
-            return t_comm, t_comp, t_total, t_overlap + t_select_us
+
+            # Durations from the SAME overlapped execution
+            t_wall_us = float(start.elapsed_time(end)) * 1000.0
+            t_comm_us = float(comm_start.elapsed_time(comm_end)) * 1000.0
+            t_comp_us = float(comp_start.elapsed_time(comp_end)) * 1000.0
+            t_dispatch_us = t_select_us + t_comm_us + t_comp_us
+            t_dispatch_overlap_us = t_select_us + t_wall_us
+            return t_comm_us, t_comp_us, t_dispatch_us, t_dispatch_overlap_us
 
         if overlap:
-            t_comm_us, t_comp_us, t_total_us, t_total_overlap_us = overlapped_total()
+            t_comm_us, t_comp_us, t_dispatch_us, t_dispatch_overlap_us = overlapped_total()
         else:
-            t_comm_us, t_comp_us, t_total_us, t_total_overlap_us = sequential_total()
+            t_comm_us, t_comp_us, t_dispatch_us = sequential_total()
+            t_dispatch_overlap_us = t_dispatch_us
 
-        eta = float((t_select_us + t_comm_us + t_comp_us) / max(t_total_overlap_us, 1e-6))
+        eta = float((t_select_us + t_comm_us + t_comp_us) / max(t_dispatch_overlap_us, 1e-6))
         return EPResult(
             t_select_us=t_select_us,
             t_comm_us=t_comm_us,
             t_comp_us=t_comp_us,
-            t_total_us=t_total_us,
-            t_total_overlap_us=t_total_overlap_us,
+            t_dispatch_us=t_dispatch_us,
+            t_dispatch_overlap_us=t_dispatch_overlap_us,
             eta_overlap=eta,
             load_max_over_mean=load_max_over_mean,
             load_cv=load_cv,
@@ -401,20 +422,20 @@ def main() -> None:
             print("T_comm_us(mean):", avg_field(res_seq, "t_comm_us"))
             print("load_max_over_mean(mean):", avg_field(res_seq, "load_max_over_mean"))
             print("load_cv(mean):", avg_field(res_seq, "load_cv"))
-            print("T_total_us(mean, sequential):", avg_field(res_seq, "t_total_us"))
-            print("T_total_us(mean, overlapped):", avg_field(res_ovl, "t_total_overlap_us"))
+            print("T_dispatch_us(mean, sequential):", avg_field(res_seq, "t_dispatch_us"))
+            print("T_dispatch_us(mean, overlapped):", avg_field(res_ovl, "t_dispatch_overlap_us"))
             print("eta_overlap(mean):", avg_field(res_ovl, "eta_overlap"))
         else:
             print("")
-            print("=== E2E MoE Layer Latency (us, mean) ===")
+            print("=== Dispatch-Path Latency (us, mean) ===")
             print(
-                f"{'strategy':<12} {'T_select':>10} {'ΔT_select':>10} {'T_comm':>10} {'T_total(seq)':>14} {'T_total(ovl)':>14} {'eta':>8}"
+                f"{'strategy':<12} {'T_select':>10} {'ΔT_select':>10} {'T_comm':>10} {'T_dispatch(seq)':>16} {'T_dispatch(ovl)':>16} {'eta':>8}"
             )
             for s in strategies:
                 res_seq, res_ovl = results[s]
                 t_sel = avg_field(res_seq, "t_select_us")
                 print(
-                    f"{s:<12} {t_sel:10.1f} {(t_sel - t_base_select):10.1f} {avg_field(res_seq, 't_comm_us'):10.1f} {avg_field(res_seq, 't_total_us'):14.1f} {avg_field(res_ovl, 't_total_overlap_us'):14.1f} {avg_field(res_ovl, 'eta_overlap'):8.3f}"
+                    f"{s:<12} {t_sel:10.1f} {(t_sel - t_base_select):10.1f} {avg_field(res_seq, 't_comm_us'):10.1f} {avg_field(res_seq, 't_dispatch_us'):16.1f} {avg_field(res_ovl, 't_dispatch_overlap_us'):16.1f} {avg_field(res_ovl, 'eta_overlap'):8.3f}"
                 )
 
 if __name__ == "__main__":

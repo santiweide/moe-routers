@@ -159,6 +159,11 @@ python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 -
 
 Run on a node with **2×A100 (PCIe)**:
 
+Note: **Strategy A (`masked_matmul`) is single-GPU only** in this repo (no permutation / dense masking idea) and is **not implemented** in the 2-GPU EP benchmark. For 2-GPU, you can compare:
+- Baseline: `naive_topk`
+- Strategy B (partial): `fused_select` (fused top-k+softmax selection; pack/dispatch still in Torch)
+- Strategy C: `sinkhorn` (balanced routing)
+
 Naive Top-k baseline:
 
 ```bash
@@ -176,6 +181,12 @@ Sinkhorn (Strategy C):
 
 ```bash
 torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy sinkhorn --sinkhorn_iters 10 --sinkhorn_temperature 1.0
+```
+
+Run all supported 2-GPU strategies (prints a comparison table on rank0):
+
+```bash
+torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --all_strategies
 ```
 
 With synthetic skew:
