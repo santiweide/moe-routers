@@ -200,5 +200,13 @@ torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_mo
 
 Memory latency
 ```
-python bench_router.py --perm_sweep --device cuda --dtype fp16 --d_model 4096 --experts 64 --top_k 2 --seq_len 128 --batch_sizes 1 2 4 8 16 32 64 --warmup 5 --iters 20 --csv_out perm_efficiency.csv --plot_out perm_efficiency.png
+python bench_router.py \
+  --perm_sweep --device cuda --dtype fp16 \
+  --d_model 4096 --experts 64 --top_k 2 --seq_len 128 \
+  --batch_sizes 1 2 4 8 16 32 64 \
+  --naive_impl atomic_triton \
+  --peak_bw_gbs 1555 \
+  --warmup 5 --iters 20 \
+  --csv_out perm_efficiency.csv \
+  --plot_out perm_efficiency.png
 ```

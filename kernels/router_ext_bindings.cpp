@@ -6,19 +6,18 @@
 std::vector<torch::Tensor> topk_router_forward_cuda(torch::Tensor logits, int64_t k);
 
 std::vector<torch::Tensor> topk_router_forward(torch::Tensor logits, int64_t k) {
-  if (!logits.is_cuda()) {
-    throw std::runtime_error("topk_router_forward: logits must be a CUDA tensor");
-  }
-  if (logits.dim() != 2) {
-    throw std::runtime_error("topk_router_forward: logits must be rank-2 [tokens, experts]");
-  }
-  if (k <= 0) {
-    throw std::runtime_error("topk_router_forward: k must be > 0");
-  }
+  TORCH_CHECK(logits.is_cuda(), "topk_router_forward: logits must be a CUDA tensor");
+  TORCH_CHECK(logits.dim() == 2, "topk_router_forward: logits must be rank-2 [tokens, experts]");
+  TORCH_CHECK(k > 0, "topk_router_forward: k must be > 0");
   // Kernel implementation is optimized for small k; keep it bounded.
-  if (k > 8) {
-    throw std::runtime_error("topk_router_forward: k must be <= 8 (kernel limitation)");
-  }
+  TORCH_CHECK(k <= 8, "topk_router_forward: k must be <= 8 (kernel limitation)");
+  TORCH_CHECK(k <= logits.size(1), "topk_router_forward: k must be <= experts (logits.size(1))");
+
+  // The CUDA kernel expects row-major contiguous memory for best performance.
+  TORCH_CHECK(
+      logits.is_contiguous(),
+      "topk_router_forward: logits must be contiguous; call logits = logits.contiguous()");
+
   return topk_router_forward_cuda(logits, k);
 }
 

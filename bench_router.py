@@ -120,6 +120,108 @@ def _pack_routes_naive_mask_scan(
     return torch.cat(xs, dim=0), torch.cat(toks, dim=0), torch.cat(exps, dim=0)
 
 
+def _maybe_import_triton():
+    try:
+        import triton  # type: ignore
+        import triton.language as tl  # type: ignore
+
+        return triton, tl
+    except Exception:
+        return None, None
+
+
+def _pack_routes_naive_atomic_triton(
+    x: torch.Tensor, topk_idx: torch.Tensor, topk_w: torch.Tensor, n_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Naive-ish GPU baseline closer to "random write" behavior:
+    - Flatten routes (token_id, expert_id, weight)
+    - Compute expert counts + prefix offsets
+    - For each route, do atomic increment into that expert's counter to pick a slot
+    - Write x[token] * w into output at (base[expert] + slot, :)
+
+    This produces scattered writes across expert segments (poor coalescing) vs the
+    sorted pack path which writes contiguous buffers.
+    """
+    triton, tl = _maybe_import_triton()
+    if triton is None or tl is None:
+        # Fall back to the mask-scan baseline if Triton isn't available.
+        return _pack_routes_naive_mask_scan(x, topk_idx, topk_w, n_experts)
+
+    if not x.is_cuda:
+        raise RuntimeError("_pack_routes_naive_atomic_triton requires CUDA tensors")
+
+    s, k = topk_idx.shape
+    d = x.size(-1)
+    routes = int(s) * int(k)
+
+    token_ids = (
+        torch.arange(s, device=x.device, dtype=torch.int64).unsqueeze(1).expand(s, k).reshape(-1)
+    )
+    expert_ids = topk_idx.reshape(-1).to(torch.int32)
+    weights = topk_w.reshape(-1).to(dtype=x.dtype)  # [R]
+
+    counts = torch.bincount(expert_ids.to(torch.int64), minlength=int(n_experts)).to(torch.int32)
+    base = (torch.cumsum(counts, dim=0) - counts).to(torch.int32)  # [E]
+    counters = torch.zeros((int(n_experts),), device=x.device, dtype=torch.int32)
+
+    y = torch.empty((routes, d), device=x.device, dtype=x.dtype)
+
+    @triton.jit
+    def _atomic_pack_kernel(
+        x_ptr,
+        y_ptr,
+        token_ptr,
+        expert_ptr,
+        w_ptr,
+        base_ptr,
+        counter_ptr,
+        R: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        r = tl.program_id(0)
+        # Guard (in case grid is padded)
+        if r >= R:
+            return
+
+        tok = tl.load(token_ptr + r).to(tl.int32)
+        exp = tl.load(expert_ptr + r).to(tl.int32)
+        wt = tl.load(w_ptr + r).to(tl.float32)
+
+        # Atomic slot allocation per expert.
+        slot = tl.atomic_add(counter_ptr + exp, 1)
+        base_off = tl.load(base_ptr + exp).to(tl.int32)
+        out_row = base_off + slot
+
+        # Write output row in chunks along D.
+        # Note: This is the intentionally "naive/random" memory access pattern we want.
+        for d0 in tl.static_range(0, D, BLOCK_D):
+            offs = d0 + tl.arange(0, BLOCK_D)
+            m = offs < D
+            x_vals = tl.load(x_ptr + tok * D + offs, mask=m, other=0.0).to(tl.float32)
+            out = x_vals * wt
+            tl.store(y_ptr + out_row * D + offs, out.to(tl.float16), mask=m)
+
+    # Choose a modest block for D-chunking to keep register pressure reasonable.
+    # (D is a constexpr so Triton will fully unroll static_range.)
+    grid = (routes,)
+    _atomic_pack_kernel[grid](
+        x,
+        y,
+        token_ids.to(torch.int32),
+        expert_ids,
+        weights,
+        base,
+        counters,
+        R=routes,
+        D=int(d),
+        BLOCK_D=128,
+        num_warps=4,
+    )
+    return y, token_ids, expert_ids.to(torch.int64)
+
+
 def _peak_dram_bandwidth_gbs() -> Optional[float]:
     """
     Approximate theoretical peak DRAM bandwidth from CUDA device props.
@@ -184,7 +286,7 @@ def _run_perm_sweep(args, *, device: torch.device, dtype: torch.dtype) -> None:
         raise RuntimeError("--perm_sweep requires --device cuda")
 
     torch.manual_seed(0)
-    bw_gbs = _peak_dram_bandwidth_gbs()
+    bw_gbs = float(args.peak_bw_gbs) if args.peak_bw_gbs is not None else _peak_dram_bandwidth_gbs()
 
     # We'll generate synthetic routes to isolate packing/permutation cost:
     # topk_idx: [S, K] int64, topk_w: [S, K] same dtype as x.
@@ -231,7 +333,10 @@ def _run_perm_sweep(args, *, device: torch.device, dtype: torch.dtype) -> None:
 
             def time_naive() -> float:
                 def fn():
-                    y, tok, exp = _pack_routes_naive_mask_scan(x, topk_idx, topk_w, e)
+                    if args.naive_impl == "mask_scan":
+                        y, tok, exp = _pack_routes_naive_mask_scan(x, topk_idx, topk_w, e)
+                    else:
+                        y, tok, exp = _pack_routes_naive_atomic_triton(x, topk_idx, topk_w, e)
                     # Prevent DCE / ensure some dependency.
                     _ = (y.sum() + tok.sum().to(y.dtype) + exp.sum().to(y.dtype)) * 0.0
 
@@ -270,7 +375,7 @@ def _run_perm_sweep(args, *, device: torch.device, dtype: torch.dtype) -> None:
                     t_perm_naive_ms=float(t_perm_naive),
                     t_perm_sorted_ms=float(t_perm_sorted),
                     t_theory_ms=float(t_theory_ms),
-                    peak_bw_gbs=float(bw_gbs) if bw_gbs is not None else float("nan"),
+                        peak_bw_gbs=float(bw_gbs) if bw_gbs is not None else float("nan"),
                     sorted_achieved_bw_gbs=float(achieved_sorted),
                 )
             )
@@ -300,6 +405,19 @@ def main() -> None:
     p.add_argument("--seq_len", type=int, default=128, help="Used with --perm_sweep: tokens = batch_size * seq_len")
     p.add_argument("--csv_out", type=str, default="perm_efficiency.csv")
     p.add_argument("--plot_out", type=str, default="perm_efficiency.png")
+    p.add_argument(
+        "--naive_impl",
+        type=str,
+        default="atomic_triton",
+        choices=["atomic_triton", "mask_scan"],
+        help="Naive baseline implementation used by --perm_sweep.",
+    )
+    p.add_argument(
+        "--peak_bw_gbs",
+        type=float,
+        default=None,
+        help="Optional: manually set theoretical peak DRAM bandwidth in GB/s (overrides auto-detect).",
+    )
     p.add_argument(
         "--strategies",
         type=str,
