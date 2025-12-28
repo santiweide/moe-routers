@@ -1,166 +1,145 @@
-#include <torch/extension.h>
-
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <cub/cub.cuh>
-
-#include <vector>
-
 namespace {
 
 constexpr int MAX_K = 8;
 
+template <typename T> struct Pack2T { using type = T; static constexpr int width = 1; };
+template <> struct Pack2T<float> { using type = float2; static constexpr int width = 2; };
+#if defined(__CUDA_ARCH__)
+template <> struct Pack2T<at::Half> { using type = __half2; static constexpr int width = 2; };
+template <> struct Pack2T<at::BFloat16> { using type = __nv_bfloat162; static constexpr int width = 2; };
+#endif
+
 template <typename T>
-__device__ __forceinline__ float to_float(T v) {
-  return static_cast<float>(v);
-}
+__device__ __forceinline__ float to_float(T v) { return static_cast<float>(v); }
 
 template <>
 __device__ __forceinline__ float to_float<at::Half>(at::Half v) {
-  return __half2float(reinterpret_cast<const __half&>(v));
+  return __half2float(*reinterpret_cast<const __half*>(&v));
 }
 
 template <>
 __device__ __forceinline__ float to_float<at::BFloat16>(at::BFloat16 v) {
-  // Use ATen's bf16 conversion; avoids depending on __nv_bfloat16 internal layout.
   return static_cast<float>(v);
-}
-
-__device__ __forceinline__ void insert_topk(float val, int idx, float* topv, int* topi, int k) {
-  // Keep arrays sorted descending.
-  int pos = k;
-  for (int j = 0; j < k; ++j) {
-    if (val > topv[j]) {
-      pos = j;
-      break;
-    }
-  }
-  if (pos == k) return;
-  for (int j = k - 1; j > pos; --j) {
-    topv[j] = topv[j - 1];
-    topi[j] = topi[j - 1];
-  }
-  topv[pos] = val;
-  topi[pos] = idx;
 }
 
 template <int K>
 __device__ __forceinline__ void init_topk(float* v, int* i) {
   #pragma unroll
-  for (int j = 0; j < K; ++j) {
-    v[j] = -INFINITY;
-    i[j] = -1;
-  }
+  for (int j = 0; j < K; ++j) { v[j] = -CUDART_INF_F; i[j] = -1; }
 }
 
 template <int K>
 __device__ __forceinline__ void insert_topk_k(float val, int idx, float* topv, int* topi) {
-  // Keep arrays sorted descending.
   int pos = K;
   #pragma unroll
-  for (int j = 0; j < K; ++j) {
-    if (val > topv[j]) {
-      pos = j;
-      break;
-    }
-  }
+  for (int j = 0; j < K; ++j) { if (val > topv[j]) { pos = j; break; } }
   if (pos == K) return;
-  for (int j = K - 1; j > pos; --j) {
-    topv[j] = topv[j - 1];
-    topi[j] = topi[j - 1];
-  }
-  topv[pos] = val;
-  topi[pos] = idx;
+  for (int j = K - 1; j > pos; --j) { topv[j] = topv[j - 1]; topi[j] = topi[j - 1]; }
+  topv[pos] = val; topi[pos] = idx;
 }
 
 template <int K>
-__device__ __forceinline__ void merge_two_lists(float* va, int* ia, const float* vb, const int* ib) {
-  // Merge list_b into list_a and keep top-K in list_a.
-  float tv[2 * K];
-  int ti[2 * K];
+__device__ __forceinline__ void merge_two_lists(float* va, int* ia,
+                                                const float* vb, const int* ib) {
+  float tv[2 * K]; int ti[2 * K];
   #pragma unroll
-  for (int j = 0; j < K; ++j) {
-    tv[j] = va[j];
-    ti[j] = ia[j];
-    tv[K + j] = vb[j];
-    ti[K + j] = ib[j];
-  }
-
-  // Select top-K (descending) via small selection sort.
+  for (int j = 0; j < K; ++j) { tv[j] = va[j]; ti[j] = ia[j]; tv[K + j] = vb[j]; ti[K + j] = ib[j]; }
   #pragma unroll
   for (int m = 0; m < K; ++m) {
     int best = m;
     #pragma unroll
-    for (int j = m + 1; j < 2 * K; ++j) {
-      if (tv[j] > tv[best]) best = j;
-    }
-    // swap
-    float fv = tv[m];
-    int fi = ti[m];
-    tv[m] = tv[best];
-    ti[m] = ti[best];
-    tv[best] = fv;
-    ti[best] = fi;
+    for (int j = m + 1; j < 2 * K; ++j) { if (tv[j] > tv[best]) best = j; }
+    float fv = tv[m]; int fi = ti[m];
+    tv[m] = tv[best]; ti[m] = ti[best]; tv[best] = fv; ti[best] = fi;
   }
-
   #pragma unroll
-  for (int j = 0; j < K; ++j) {
-    va[j] = tv[j];
-    ia[j] = ti[j];
+  for (int j = 0; j < K; ++j) { va[j] = tv[j]; ia[j] = ti[j]; }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void load_pair_accumulate(const scalar_t* base, int e0, int emax,
+                                                     float* local_v, int* local_i) {
+  using P2 = typename Pack2T<scalar_t>::type;
+  constexpr int W = Pack2T<scalar_t>::width;
+  if constexpr (W == 2) {
+    const int e = e0 * 2;
+    if (e + 1 < emax) {
+      // 对齐：若未对齐，GPU 也能正确访问，但可能降速；实际训练中 logits 常 128/256 对齐。
+      const P2 v2 = *reinterpret_cast<const P2*>(base + e);
+      float v0, v1;
+      if constexpr (std::is_same<scalar_t,float>::value) {
+        const float2& f2 = reinterpret_cast<const float2&>(v2);
+        v0 = f2.x; v1 = f2.y;
+      } else if constexpr (std::is_same<scalar_t,at::Half>::value) {
+        const __half2& h2 = reinterpret_cast<const __half2&>(v2);
+        v0 = __half2float(__low2half(h2)); v1 = __half2float(__high2half(h2));
+      } else { // bfloat16
+        const __nv_bfloat162& b2 = reinterpret_cast<const __nv_bfloat162&>(v2);
+        v0 = __bfloat162float(__low2bfloat16(b2)); v1 = __bfloat162float(__high2bfloat16(b2));
+      }
+      insert_topk_k<MAX_K>(v0, e,   local_v, local_i);
+      insert_topk_k<MAX_K>(v1, e+1, local_v, local_i);
+    } else if (e < emax) {
+      float v = to_float<scalar_t>(base[e]);
+      insert_topk_k<MAX_K>(v, e, local_v, local_i);
+    }
+  } else {
+    const int e = e0;
+    if (e < emax) {
+      float v = to_float<scalar_t>(base[e]);
+      insert_topk_k<MAX_K>(v, e, local_v, local_i);
+    }
   }
 }
 
-template <typename scalar_t, int K>
+template <typename scalar_t, int K, int BLOCK_THREADS>
 __global__ void topk_router_kernel_warp_reduce(
     const scalar_t* __restrict__ logits,
     int32_t* __restrict__ out_idx,
     float* __restrict__ out_w,
     int tokens,
     int experts) {
-  int t = blockIdx.x;
+
+  static_assert(K <= MAX_K, "K exceeds MAX_K");
+  const int t = blockIdx.x;
   if (t >= tokens) return;
 
-  float local_v[K];
-  int local_i[K];
+  float local_v[K]; int local_i[K];
   init_topk<K>(local_v, local_i);
 
   const scalar_t* row = logits + static_cast<int64_t>(t) * experts;
-  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
-    float v = to_float<scalar_t>(row[e]);
-    insert_topk_k<K>(v, e, local_v, local_i);
+
+  // 线程块内分块扫描；half/bf16/float 根据类型选择 2 或 1 元矢量化
+  constexpr int W = Pack2T<scalar_t>::width;
+  const int stride = BLOCK_THREADS;
+  if constexpr (W == 2) {
+    for (int e2 = threadIdx.x; e2 * 2 < experts; e2 += stride)
+      load_pair_accumulate(row, e2, experts, local_v, local_i);
+  } else {
+    for (int e = threadIdx.x; e < experts; e += stride)
+      load_pair_accumulate(row, e, experts, local_v, local_i);
   }
 
-  // Warp-level reduction with shuffles: merge top-K lists across lanes.
-  const unsigned mask = 0xffffffffu;
+  const unsigned mask = __activemask();
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
+  // warp 内 XOR-蝶形合并
   #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    float other_v[K];
-    int other_i[K];
-    if (lane + offset < 32) {
-      #pragma unroll
-      for (int j = 0; j < K; ++j) {
-        other_v[j] = __shfl_down_sync(mask, local_v[j], offset);
-        other_i[j] = __shfl_down_sync(mask, local_i[j], offset);
-      }
-    } else {
-      #pragma unroll
-      for (int j = 0; j < K; ++j) {
-        other_v[j] = -INFINITY;
-        other_i[j] = -1;
-      }
+    float ov[K]; int oi[K];
+    #pragma unroll
+    for (int j = 0; j < K; ++j) {
+      ov[j] = __shfl_xor_sync(mask, local_v[j], offset);
+      oi[j] = __shfl_xor_sync(mask, local_i[j], offset);
     }
-    merge_two_lists<K>(local_v, local_i, other_v, other_i);
+    merge_two_lists<K>(local_v, local_i, ov, oi);
   }
 
-  // Shared memory for per-warp winners (lane0 holds the warp top-K).
-  __shared__ float sh_v[(128 / 32) * MAX_K];
-  __shared__ int sh_i[(128 / 32) * MAX_K];
+  // 将每个 warp 的优胜 K 写到共享内存
+  constexpr int NUM_WARPS = BLOCK_THREADS / 32;
+  __shared__ float sh_v[NUM_WARPS * MAX_K];
+  __shared__ int   sh_i[NUM_WARPS * MAX_K];
   if (lane == 0) {
     #pragma unroll
     for (int j = 0; j < K; ++j) {
@@ -170,14 +149,12 @@ __global__ void topk_router_kernel_warp_reduce(
   }
   __syncthreads();
 
-  // Final reduction in warp 0: reduce over num_warps lists.
+  // 由 warp0 再做一次 XOR 归约（跨 warp）
   if (warp == 0) {
-    float v[K];
-    int i[K];
+    float v[K]; int i[K];
     init_topk<K>(v, i);
 
-    const int num_warps = blockDim.x / 32;
-    if (lane < num_warps) {
+    if (lane < NUM_WARPS) {
       #pragma unroll
       for (int j = 0; j < K; ++j) {
         v[j] = sh_v[lane * MAX_K + j];
@@ -185,66 +162,52 @@ __global__ void topk_router_kernel_warp_reduce(
       }
     }
 
+    const unsigned m0 = __activemask();
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-      float other_v[K];
-      int other_i[K];
-      if (lane + offset < 32) {
-        #pragma unroll
-        for (int j = 0; j < K; ++j) {
-          other_v[j] = __shfl_down_sync(mask, v[j], offset);
-          other_i[j] = __shfl_down_sync(mask, i[j], offset);
-        }
-      } else {
-        #pragma unroll
-        for (int j = 0; j < K; ++j) {
-          other_v[j] = -INFINITY;
-          other_i[j] = -1;
-        }
+      float ov[K]; int oi[K];
+      #pragma unroll
+      for (int j = 0; j < K; ++j) {
+        ov[j] = __shfl_xor_sync(m0, v[j], offset);
+        oi[j] = __shfl_xor_sync(m0, i[j], offset);
       }
-      merge_two_lists<K>(v, i, other_v, other_i);
+      merge_two_lists<K>(v, i, ov, oi);
     }
 
     if (lane == 0) {
-      // Softmax over top-k logits -> weights.
+      // 仅对 top-K 做稳定 Softmax
       float m = v[0];
       #pragma unroll
       for (int j = 1; j < K; ++j) m = fmaxf(m, v[j]);
-      float denom = 0.0f;
-      float exps[K];
+      float denom = 0.f, exps[K];
       #pragma unroll
-      for (int j = 0; j < K; ++j) {
-        float ev = __expf(v[j] - m);
-        exps[j] = ev;
-        denom += ev;
-      }
+      for (int j = 0; j < K; ++j) { exps[j] = __expf(v[j] - m); denom += exps[j]; }
       denom = fmaxf(denom, 1e-9f);
 
       int32_t* idx_row = out_idx + static_cast<int64_t>(t) * K;
-      float* w_row = out_w + static_cast<int64_t>(t) * K;
+      float*   w_row   = out_w   + static_cast<int64_t>(t) * K;
       #pragma unroll
-      for (int j = 0; j < K; ++j) {
-        idx_row[j] = static_cast<int32_t>(i[j]);
-        w_row[j] = exps[j] / denom;
-      }
+      for (int j = 0; j < K; ++j) { idx_row[j] = i[j]; w_row[j] = exps[j] / denom; }
     }
   }
 }
 
-template <typename scalar_t, int K, int BLOCK_THREADS = 128>
+template <typename scalar_t, int K, int BLOCK_THREADS>
 __global__ void topk_router_kernel_cub_sort(
     const scalar_t* __restrict__ logits,
     int32_t* __restrict__ out_idx,
     float* __restrict__ out_w,
     int tokens,
     int experts) {
-  int t = blockIdx.x;
+
+  static_assert(K <= MAX_K, "K exceeds MAX_K");
+  const int t = blockIdx.x;
   if (t >= tokens) return;
 
-  // One item per thread (pad with -inf).
-  int e = threadIdx.x;
-  float key = -INFINITY;
-  int val = e;
+  const int e = threadIdx.x;
+  float key = -CUDART_INF_F;
+  int   val = e;
+
   if (e < experts) {
     const scalar_t* row = logits + static_cast<int64_t>(t) * experts;
     key = to_float<scalar_t>(row[e]);
@@ -255,209 +218,23 @@ __global__ void topk_router_kernel_cub_sort(
   BlockSort(temp_storage).SortPairsDescending(key, val);
 
   __shared__ float topv[MAX_K];
-  __shared__ int topi[MAX_K];
-  if (threadIdx.x < K) {
-    topv[threadIdx.x] = key;
-    topi[threadIdx.x] = val;
-  }
+  __shared__ int   topi[MAX_K];
+  if (threadIdx.x < K) { topv[threadIdx.x] = key; topi[threadIdx.x] = val; }
   __syncthreads();
 
   if (threadIdx.x == 0) {
-    float m = topv[0];
-    #pragma unroll
+    float m = topv[0]; #pragma unroll
     for (int j = 1; j < K; ++j) m = fmaxf(m, topv[j]);
-    float denom = 0.0f;
-    float exps[K];
+    float denom = 0.f, exps[K];
     #pragma unroll
-    for (int j = 0; j < K; ++j) {
-      float ev = __expf(topv[j] - m);
-      exps[j] = ev;
-      denom += ev;
-    }
+    for (int j = 0; j < K; ++j) { exps[j] = __expf(topv[j] - m); denom += exps[j]; }
     denom = fmaxf(denom, 1e-9f);
 
     int32_t* idx_row = out_idx + static_cast<int64_t>(t) * K;
-    float* w_row = out_w + static_cast<int64_t>(t) * K;
+    float*   w_row   = out_w   + static_cast<int64_t>(t) * K;
     #pragma unroll
-    for (int j = 0; j < K; ++j) {
-      idx_row[j] = static_cast<int32_t>(topi[j]);
-      w_row[j] = exps[j] / denom;
-    }
+    for (int j = 0; j < K; ++j) { idx_row[j] = topi[j]; w_row[j] = exps[j] / denom; }
   }
 }
 
-}  // namespace
-
-std::vector<torch::Tensor> topk_router_forward_cuda(torch::Tensor logits, int64_t k) {
-  // logits: [tokens, experts] on CUDA
-  const auto tokens = static_cast<int>(logits.size(0));
-  const auto experts = static_cast<int>(logits.size(1));
-  const int kk = static_cast<int>(k);
-
-  auto idx = torch::empty({tokens, kk}, logits.options().dtype(torch::kInt32));
-  auto w = torch::empty({tokens, kk}, logits.options().dtype(torch::kFloat32));
-
-  const int threads = 128;
-  const dim3 blocks(tokens);
-
-  auto stream = at::cuda::getDefaultCUDAStream();
-
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      logits.scalar_type(),
-      "topk_router_forward_cuda",
-      [&] {
-        // Strategy selection:
-        // - experts <= 128: CUB BlockRadixSort (fast full sort in-block)
-        // - otherwise     : warp-shuffle reduction (merge top-K lists)
-        const bool use_cub = (experts <= 128);
-
-        switch (kk) {
-          case 1:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 1><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 1><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 2:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 2><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 2><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 3:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 3><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 3><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 4:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 4><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 4><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 5:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 5><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 5><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 6:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 6><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 6><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 7:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 7><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 7><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          case 8:
-            if (use_cub) {
-              topk_router_kernel_cub_sort<scalar_t, 8><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            } else {
-              topk_router_kernel_warp_reduce<scalar_t, 8><<<blocks, threads, 0, stream>>>(
-                  reinterpret_cast<const scalar_t*>(logits.data_ptr()),
-                  idx.data_ptr<int32_t>(),
-                  w.data_ptr<float>(),
-                  tokens,
-                  experts);
-            }
-            break;
-          default:
-            // k is validated in the C++ binding (k<=8), but keep a guard here too.
-            TORCH_CHECK(false, "topk_router_forward_cuda: unsupported k (expected 1..8)");
-        }
-      });
-
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {idx, w};
-}
-
-
+} // namespace

@@ -210,3 +210,14 @@ python bench_router.py \
   --csv_out perm_efficiency.csv \
   --plot_out perm_efficiency.png
 ```
+
+
+
+```
+ncu --print-details \
+    --section SpeedOfLight \
+    --section MemoryWorkloadAnalysis \
+    -k regex:fused \
+    -c 1 \
+    python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy fused_select
+```
