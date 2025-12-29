@@ -221,3 +221,18 @@ ncu --print-details \
     -c 1 \
     python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy fused_select
 ```
+
+
+```
+git submodule add -b v3.5.0 https://github.com/NVIDIA/cutlass.git third_party/cutlass
+git -C third_party/cutlass checkout v3.5.0
+python setup_fused_select.py build_ext --inplace
+```
+
+
+
+
+```
+ pip install tensorboard && tensorboard --logdir=./log/moe_trace
+
+ ```
