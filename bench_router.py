@@ -26,6 +26,8 @@ import torch
 
 from models.decoder_moe import SinkhornRouter, TorchTopKRouter
 
+import fused_select_cuda as fsel
+
 
 def _maybe_import_router_ext():
     try:
@@ -532,10 +534,11 @@ def main() -> None:
                 return
 
             if strategy == "fused_select" and ext is not None and logits.is_cuda and args.top_k <= 8:
-                idx_i32, w_f32 = ext.forward(logits, int(args.top_k))
+                idx_i32, w_f32, counts_i32, offsets_i32, packed = fsel.fused_select_forward(logits, x)
                 topk_idx = idx_i32.to(torch.int64)
                 topk_w = w_f32.to(dtype=logits.dtype)
                 return
+
 
             # naive_topk
             topk_vals, topk_idx = torch.topk(logits, k=args.top_k, dim=-1)
@@ -544,6 +547,8 @@ def main() -> None:
         t_select = _cuda_time(do_select)
 
         def do_pack():
+            if strategy == "masked_matmul":
+                return
             if strategy == "masked_matmul":
                 return
             _pack_routes(x, topk_idx, topk_w)

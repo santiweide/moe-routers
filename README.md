@@ -139,7 +139,7 @@ python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 -
 Strategy B (Fused selection, requires extension):
 
 ```bash
-python setup_router_ext.py build_ext --inplace
+python setup_fused_select.py build_ext --inplace
 python bench_router.py --device cuda --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy fused_select
 ```
 
@@ -173,7 +173,7 @@ torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_mo
 Fused selection (partial Strategy B):
 
 ```bash
-python setup_router_ext.py build_ext --inplace
+python setup_fused_select.py build_ext --inplace
 torchrun --nproc_per_node 2 bench_2gpu_pcie.py --dtype fp16 --tokens 4096 --d_model 4096 --experts 64 --top_k 2 --strategy fused_select
 ```
 

@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 
 from models.decoder_moe import SinkhornRouter, TorchTopKRouter
+import fused_select_cuda as fsel
 
 
 def _maybe_import_router_ext():
@@ -206,7 +207,7 @@ def main() -> None:
                 topk_idx, topk_w = sinkhorn_router(logits, k)
                 return
             if st == "fused_select" and ext is not None and k <= 8:
-                idx_i32, w_f32 = ext.forward(logits, int(k))
+                idx_i32, w_f32 = fsel.fused_select_forward(logits, int(k))
                 topk_idx = idx_i32.to(torch.int64)
                 topk_w = w_f32.to(dtype=logits.dtype)
                 return
