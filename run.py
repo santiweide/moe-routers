@@ -331,7 +331,7 @@ def main() -> None:
         type=str,
         default="torch",
         choices=["torch", "cuda_ext", "sinkhorn"],
-        help="(decoder_moe) router backend: torch, CUDA extension (router_ext_cuda), or sinkhorn (balanced routing).",
+        help="(decoder_moe) router backend: torch, CUDA extension (fused_select_cuda), or sinkhorn (balanced routing).",
     )
     parser.add_argument(
         "--compare_moe_routers",
@@ -389,12 +389,12 @@ def main() -> None:
         # Best-effort availability hint for cuda_ext
         if args.device == "cuda":
             try:
-                import router_ext_cuda  # type: ignore  # noqa: F401
+                import fused_select_cuda  # type: ignore  # noqa: F401
                 cuda_ext_available = True
             except Exception:
                 cuda_ext_available = False
             if not cuda_ext_available:
-                print("WARNING: router_ext_cuda not available; 'cuda_ext' will fall back to torch inside the model.")
+                print("WARNING: fused_select_cuda not available; 'cuda_ext' will fall back to torch inside the model.")
 
         routers = ["torch", "cuda_ext", "sinkhorn"]
         print("=== Compare MoE Routers (E2E + breakdown) ===")

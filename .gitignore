@@ -1,5 +1,4 @@
 __pycache__
 build
-router_ext_cuda.cpython-312-x86_64-linux-gnu.so
 *.so
 log

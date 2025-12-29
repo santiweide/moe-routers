@@ -113,7 +113,7 @@ This repo includes two scripts that map to the experiment design:
   - Supports strategies:
     - `naive_topk`
     - `masked_matmul` (Strategy A, no permutation; only viable for small E)
-    - `fused_select` (partial Strategy B: uses `router_ext_cuda.forward()` for top-k+softmax; pack still in Torch)
+    - `fused_select` (partial Strategy B: uses `fused_select_cuda.forward()` for top-k+softmax; pack still in Torch)
     - `sinkhorn` (Strategy C: algorithmic load balancing)
 
 - `bench_2gpu_pcie.py`: **2-GPU EP (PCIe) benchmark** run via `torchrun`, measuring:

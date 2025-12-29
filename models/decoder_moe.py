@@ -35,11 +35,11 @@ from .metrics import (
 )
 
 
-def _try_import_router_ext():
+def _try_import_fused_select_ext():
     try:
-        import router_ext_cuda  # type: ignore
+        import fused_select_cuda  # type: ignore
 
-        return router_ext_cuda
+        return fused_select_cuda
     except Exception:
         return None
 
@@ -124,11 +124,11 @@ class SinkhornRouter(RouterBase):
 
 
 class CUDATopKRouter(RouterBase):
-    """Uses the `router_ext_cuda` pybind/CUDA extension for top-k routing."""
+    """Uses the `fused_select_ext_cuda` pybind/CUDA extension for top-k routing."""
 
     def __init__(self):
         super().__init__()
-        self._ext = _try_import_router_ext()
+        self._ext = _try_import_fused_select_ext()
 
     @property
     def available(self) -> bool:

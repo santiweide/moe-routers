@@ -31,9 +31,9 @@ import fused_select_cuda as fsel
 
 def _maybe_import_router_ext():
     try:
-        import router_ext_cuda  # type: ignore
+        import fused_select_cuda  # type: ignore
 
-        return router_ext_cuda
+        return fused_select_cuda
     except Exception:
         return None
 
@@ -480,7 +480,7 @@ def main() -> None:
         raise ValueError(f"Unknown strategies: {unknown}. Valid: {strategies_all}")
 
     if "fused_select" in strategies and ext is None and device.type == "cuda":
-        print("WARNING: strategy=fused_select requested but router_ext_cuda is not available; will fall back to naive_topk.")
+        print("WARNING: strategy=fused_select requested but fused_select_cuda is not available; will fall back to naive_topk.")
 
     def one_iter(strategy: str) -> Timing:
         if device.type != "cuda":
