@@ -29,7 +29,7 @@ from models.decoder_moe import SinkhornRouter, TorchTopKRouter
 import fused_select_cuda as fsel
 
 
-def _maybe_import_router_ext():
+def _maybe_import_fused_select():
     try:
         import fused_select_cuda  # type: ignore
 
@@ -176,7 +176,7 @@ def main() -> None:
     w3 = torch.randn(E_local, hidden, args.d_model, device=device, dtype=dtype)
     w2 = torch.randn(E_local, args.d_model, hidden, device=device, dtype=dtype)
 
-    ext = _maybe_import_router_ext()
+    ext = _maybe_import_fused_select()
     torch_router = TorchTopKRouter()
     sinkhorn_router = SinkhornRouter(iters=args.sinkhorn_iters, temperature=args.sinkhorn_temperature)
 

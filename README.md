@@ -58,7 +58,7 @@ python run.py --model decoder_moe --moe_router sinkhorn --sinkhorn_iters 10 --si
 Build and use the CUDA router extension (A100-friendly):
 
 ```bash
-python setup_router_ext.py build_ext --inplace
+python setup_fused_select.py build_ext --inplace
 python run.py --model decoder_moe --moe_router cuda_ext --device cuda --dtype fp16 --batch 2 --seq_len 128 --vocab_size 32000 --d_model 512 --n_heads 8 --n_layers 6 --mlp_hidden_dim 2048 --moe_n_experts 8 --moe_top_k 2
 ```
 
@@ -72,7 +72,7 @@ loading a newer GCC module and setting:
 
 ```bash
 module load gcc/11.2.0
-python setup_router_ext.py build_ext --inplace
+python setup_fused_select.py build_ext --inplace
 ```
 
 ## Export (Netron-friendly ONNX)

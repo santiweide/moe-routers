@@ -4,7 +4,7 @@ Router microbenchmark (single process / single GPU).
 
 Matches the paper-style breakdown:
   T_logit  : router logit matmul (x @ W^T)
-  T_select : selection (Top-k / Sinkhorn / CUDA router_ext)
+  T_select : selection (Top-k / Sinkhorn / CUDA fused_select)
   T_pack   : pack routes (token_ids/expert_ids sort + input gather)
   T_route  : sum of the above
 
@@ -29,7 +29,7 @@ from models.decoder_moe import SinkhornRouter, TorchTopKRouter
 import fused_select_cuda as fsel
 
 
-def _maybe_import_router_ext():
+def _maybe_import_fused_select():
     try:
         import fused_select_cuda  # type: ignore
 
@@ -463,7 +463,7 @@ def main() -> None:
     # Router weight: [E, d]
     w = torch.randn(args.experts, args.d_model, device=device, dtype=dtype)
 
-    ext = _maybe_import_router_ext()
+    ext = _maybe_import_fused_select()
     torch_router = TorchTopKRouter()
     sinkhorn_router = SinkhornRouter(iters=args.sinkhorn_iters, temperature=args.sinkhorn_temperature)
 
