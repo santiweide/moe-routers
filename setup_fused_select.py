@@ -15,6 +15,7 @@ common_nvcc_flags = [
     '-D__CUDA_NO_HALF_OPERATORS__',
     '-D__CUDA_NO_HALF_CONVERSIONS__',
     '-D__CUDA_NO_HALF2_OPERATORS__',
+    '-DTORCH_USE_CUDA_DSA',
 ]
 
 setup(
@@ -43,3 +44,4 @@ setup(
     ],
     cmdclass={'build_ext': BuildExtension}
 )
+# how to add TORCH_USE_CUDA_DSA?

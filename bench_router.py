@@ -26,14 +26,12 @@ import torch
 
 from models.decoder_moe import SinkhornRouter, TorchTopKRouter
 
-import fused_select_cuda as fsel
-
 
 def _maybe_import_fused_select():
     try:
-        import fused_select_cuda  # type: ignore
+        import fused_select_cuda as fsel # type: ignore
 
-        return fused_select_cuda
+        return fsel
     except Exception:
         return None
 
@@ -463,7 +461,7 @@ def main() -> None:
     # Router weight: [E, d]
     w = torch.randn(args.experts, args.d_model, device=device, dtype=dtype)
 
-    ext = _maybe_import_fused_select()
+    fsel = _maybe_import_fused_select()
     torch_router = TorchTopKRouter()
     sinkhorn_router = SinkhornRouter(iters=args.sinkhorn_iters, temperature=args.sinkhorn_temperature)
 
@@ -479,7 +477,7 @@ def main() -> None:
     if unknown:
         raise ValueError(f"Unknown strategies: {unknown}. Valid: {strategies_all}")
 
-    if "fused_select" in strategies and ext is None and device.type == "cuda":
+    if "fused_select" in strategies and fsel is None and device.type == "cuda":
         print("WARNING: strategy=fused_select requested but fused_select_cuda is not available; will fall back to naive_topk.")
 
     def one_iter(strategy: str) -> Timing:
@@ -533,7 +531,7 @@ def main() -> None:
                 topk_idx, topk_w = sinkhorn_router(logits, args.top_k)
                 return
 
-            if strategy == "fused_select" and ext is not None and logits.is_cuda and args.top_k <= 8:
+            if strategy == "fused_select" and fsel is not None and logits.is_cuda and args.top_k <= 8:
                 idx_i32, w_f32, counts_i32, offsets_i32, packed = fsel.fused_select_forward(logits, x)
                 topk_idx = idx_i32.to(torch.int64)
                 topk_w = w_f32.to(dtype=logits.dtype)
@@ -547,7 +545,7 @@ def main() -> None:
         t_select = _cuda_time(do_select)
 
         def do_pack():
-            if strategy == "masked_matmul":
+            if strategy == "fused_select":
                 return
             if strategy == "masked_matmul":
                 return
